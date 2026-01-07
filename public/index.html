@@ -21,21 +21,27 @@
           A grassy outdoor meet-up with an open office interior. Your webcam
           becomes your character in the shared space.
         </p>
-        <label for="roomInput">Room</label>
+        <label for="roomInput">Lobby Code</label>
         <div class="row">
           <input
             id="roomInput"
             type="text"
-            value="lobby"
-            maxlength="32"
+            value=""
+            maxlength="12"
             autocomplete="off"
           />
           <button id="joinBtn">Join + Enable Camera</button>
+        </div>
+        <div class="row secondary">
+          <input id="shareLink" type="text" value="" readonly />
+          <button id="copyLinkBtn">Copy Link</button>
+          <button id="copyCodeBtn">Copy Code</button>
         </div>
         <div class="tips">
           <span>Click scene to lock cursor</span>
           <span>WASD + mouse to move</span>
           <span>Use Share Screen to broadcast</span>
+          <span>Copy invite link to share</span>
         </div>
       </div>
     </div>
@@ -46,8 +52,27 @@
       <div id="toolbar">
         <button id="shareBtn" disabled>Share Screen</button>
         <button id="moveShareBtn" disabled>Move Screen</button>
+        <button id="muteBtn" disabled>Mute Mic</button>
+        <div class="slider">
+          <label for="masterVolume">Volume</label>
+          <input
+            id="masterVolume"
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value="1"
+            disabled
+          />
+        </div>
       </div>
       <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+
+    <div id="volumePopup" class="hidden">
+      <div id="popupPeerName">Peer</div>
+      <input type="range" id="peerVolume" min="0" max="1" step="0.05" value="1" />
+      <button id="mutePeerBtn">Mute</button>
     </div>
 
     <script type="importmap">

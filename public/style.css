@@ -95,6 +95,11 @@ label {
   align-items: center;
 }
 
+.row.secondary {
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
 #roomInput {
   flex: 1;
   padding: 12px 14px;
@@ -104,6 +109,46 @@ label {
   color: var(--cream);
   font-size: 1rem;
   outline: none;
+}
+
+#shareLink {
+  flex: 1 1 260px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(245, 242, 234, 0.9);
+  font-size: 0.85rem;
+  font-family: "DM Mono", monospace;
+  outline: none;
+}
+
+#copyLinkBtn,
+#copyCodeBtn {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(18, 24, 30, 0.75);
+  color: rgba(245, 242, 234, 0.9);
+  font-family: "DM Mono", monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+#copyLinkBtn:hover,
+#copyCodeBtn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+}
+
+#copyLinkBtn.copied,
+#copyCodeBtn.copied {
+  background: rgba(43, 179, 167, 0.9);
+  color: #072022;
+  border-color: rgba(43, 179, 167, 0.9);
 }
 
 #roomInput:focus {
@@ -210,6 +255,12 @@ label {
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
 }
 
+#muteBtn.muted {
+  background: rgba(217, 93, 93, 0.9);
+  color: #2b0d0d;
+  border-color: rgba(217, 93, 93, 0.9);
+}
+
 #toolbar button.active {
   background: rgba(242, 178, 77, 0.9);
   color: #2a1c08;
@@ -220,6 +271,77 @@ label {
   opacity: 0.5;
   cursor: not-allowed;
   box-shadow: none;
+}
+
+#toolbar .slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(18, 24, 30, 0.6);
+  color: rgba(245, 242, 234, 0.8);
+  font-family: "DM Mono", monospace;
+  pointer-events: auto;
+}
+
+#toolbar .slider label {
+  margin: 0;
+  font-size: 0.65rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(245, 242, 234, 0.6);
+}
+
+#masterVolume {
+  width: 120px;
+}
+
+#volumePopup {
+  position: fixed;
+  top: 0;
+  left: 0;
+  transform: translate(-50%, -50%);
+  background: rgba(10, 14, 18, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+  z-index: 20;
+  min-width: 160px;
+}
+
+#volumePopup.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#popupPeerName {
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(245, 242, 234, 0.8);
+}
+
+#peerVolume {
+  width: 160px;
+}
+
+#mutePeerBtn {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(18, 24, 30, 0.75);
+  color: rgba(245, 242, 234, 0.9);
+  font-family: "DM Mono", monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
 }
 
 #localVideo {

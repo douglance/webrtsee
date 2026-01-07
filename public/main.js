@@ -9,6 +9,26 @@ const controlsHint = document.getElementById('controlsHint');
 const localVideo = document.getElementById('localVideo');
 const shareBtn = document.getElementById('shareBtn');
 const moveShareBtn = document.getElementById('moveShareBtn');
+const shareLinkInput = document.getElementById('shareLink');
+const copyLinkBtn = document.getElementById('copyLinkBtn');
+const copyCodeBtn = document.getElementById('copyCodeBtn');
+const muteBtn = document.getElementById('muteBtn');
+const masterVolume = document.getElementById('masterVolume');
+const volumePopup = document.getElementById('volumePopup');
+const popupPeerName = document.getElementById('popupPeerName');
+const peerVolume = document.getElementById('peerVolume');
+const mutePeerBtn = document.getElementById('mutePeerBtn');
+
+const MAX_PIXEL_RATIO = 1;
+const ROOM_CODE_LENGTH = 6;
+const ROOM_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const AUDIO_CONFIG = {
+  panningModel: 'equalpower',
+  distanceModel: 'inverse',
+  refDistance: 1.0,
+  maxDistance: 50.0,
+  rolloffFactor: 1.5
+};
 
 let scene;
 let camera;
@@ -18,10 +38,13 @@ let clock;
 
 let socket;
 let localStream;
+let localMediaStream;
+let localAudioStream;
 let myId;
 let joined = false;
 let hasJoinedRoom = false;
 let pendingShareStart = false;
+let isMuted = false;
 
 const peerConnections = new Map();
 const remoteAvatars = new Map();
@@ -31,6 +54,14 @@ const remoteShareVideos = new Map();
 const remoteShareMeta = new Map();
 const remoteTrackStreams = new Map();
 const remoteAvatarTrackIds = new Map();
+const remoteAudioNodes = new Map();
+
+let audioContext = null;
+let masterGain = null;
+let localMicGain = null;
+let localMicSource = null;
+let localMicDestination = null;
+let selectedPeerId = null;
 
 let screenStream;
 let screenTrackId;
@@ -51,8 +82,17 @@ const moveState = {
   forward: false,
   backward: false,
   left: false,
-  right: false
+  right: false,
+  crouch: false,
+  jumping: false
 };
+const STANDING_HEIGHT = 1.6;
+const CROUCH_HEIGHT = 0.9;
+const JUMP_HEIGHT = 0.8;
+const JUMP_DURATION = 0.4;
+
+let jumpStartTime = 0;
+let currentHeight = STANDING_HEIGHT;
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 
@@ -63,6 +103,7 @@ const lastPose = {
 };
 let lastPoseSent = 0;
 
+setupLobby();
 initScene();
 animate();
 
@@ -71,6 +112,64 @@ joinBtn.addEventListener('click', () => {
     return;
   }
   joinExperience();
+});
+
+roomInput.addEventListener('input', () => {
+  const sanitized = sanitizeRoomCode(roomInput.value);
+  if (roomInput.value !== sanitized) {
+    roomInput.value = sanitized;
+  }
+  if (sanitized) {
+    setRoomCode(sanitized, false);
+  }
+});
+
+roomInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !joined) {
+    joinExperience();
+  }
+});
+
+roomInput.addEventListener('blur', () => {
+  if (!roomInput.value.trim()) {
+    setRoomCode(generateLobbyCode(), true);
+  }
+});
+
+copyLinkBtn.addEventListener('click', () => {
+  copyToClipboard(shareLinkInput.value, copyLinkBtn);
+});
+
+copyCodeBtn.addEventListener('click', () => {
+  copyToClipboard(sanitizeRoomCode(roomInput.value), copyCodeBtn);
+});
+
+muteBtn.addEventListener('click', () => {
+  toggleLocalMute();
+});
+
+masterVolume.addEventListener('input', () => {
+  setMasterVolume(Number(masterVolume.value));
+});
+
+mutePeerBtn.addEventListener('click', () => {
+  if (!selectedPeerId) {
+    return;
+  }
+  togglePeerMute(selectedPeerId);
+  syncPeerVolumeUI(selectedPeerId);
+});
+
+peerVolume.addEventListener('input', () => {
+  if (!selectedPeerId) {
+    return;
+  }
+  setPeerVolume(selectedPeerId, Number(peerVolume.value));
+  syncPeerVolumeUI(selectedPeerId);
+});
+
+volumePopup.addEventListener('pointerdown', (event) => {
+  event.stopPropagation();
 });
 
 shareBtn.addEventListener('click', () => {
@@ -91,6 +190,361 @@ moveShareBtn.addEventListener('click', () => {
   toggleMoveShare();
 });
 
+function setupLobby() {
+  const params = new URLSearchParams(window.location.search);
+  const initialRoom = sanitizeRoomCode(params.get('room') || '');
+  setRoomCode(initialRoom || generateLobbyCode(), true);
+}
+
+function sanitizeRoomCode(value) {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+}
+
+function generateLobbyCode() {
+  let code = '';
+  for (let i = 0; i < ROOM_CODE_LENGTH; i += 1) {
+    const index = Math.floor(Math.random() * ROOM_CHARSET.length);
+    code += ROOM_CHARSET[index];
+  }
+  return code;
+}
+
+function setRoomCode(code, updateUrl) {
+  const sanitized = sanitizeRoomCode(code);
+  if (!sanitized) {
+    return;
+  }
+  roomInput.value = sanitized;
+  updateInviteLink(sanitized);
+  if (updateUrl) {
+    const url = new URL(window.location.origin + window.location.pathname);
+    url.searchParams.set('room', sanitized);
+    window.history.replaceState({}, '', url);
+  }
+}
+
+function updateInviteLink(code) {
+  const url = new URL(window.location.origin + window.location.pathname);
+  url.searchParams.set('room', code);
+  shareLinkInput.value = url.toString();
+}
+
+async function copyToClipboard(text, button) {
+  if (!text) {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    setCopyState(button, 'Copied', true);
+  } catch (err) {
+    const fallback = document.createElement('textarea');
+    fallback.value = text;
+    fallback.setAttribute('readonly', '');
+    fallback.style.position = 'absolute';
+    fallback.style.left = '-9999px';
+    document.body.appendChild(fallback);
+    fallback.select();
+    try {
+      document.execCommand('copy');
+      setCopyState(button, 'Copied', true);
+    } catch (copyErr) {
+      setCopyState(button, 'Failed', false);
+    }
+    document.body.removeChild(fallback);
+  }
+}
+
+function setCopyState(button, label, isSuccess) {
+  if (!button) {
+    return;
+  }
+  const original = button.textContent;
+  button.textContent = label;
+  if (isSuccess) {
+    button.classList.add('copied');
+  } else {
+    button.classList.remove('copied');
+  }
+  window.setTimeout(() => {
+    button.textContent = original;
+    button.classList.remove('copied');
+  }, 1400);
+}
+
+function initAudioContext() {
+  if (audioContext) {
+    return;
+  }
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) {
+    return;
+  }
+  audioContext = new Context();
+  masterGain = audioContext.createGain();
+  masterGain.gain.value = Number(masterVolume.value || 1);
+  masterGain.connect(audioContext.destination);
+}
+
+async function resumeAudioContext() {
+  if (!audioContext || audioContext.state !== 'suspended') {
+    return;
+  }
+  try {
+    await audioContext.resume();
+  } catch (err) {
+    // Ignore resume errors.
+  }
+}
+
+function createLocalAudioStream(stream) {
+  if (!audioContext || !stream) {
+    return null;
+  }
+  localMicSource = audioContext.createMediaStreamSource(stream);
+  localMicGain = audioContext.createGain();
+  localMicGain.gain.value = isMuted ? 0 : 1;
+  localMicDestination = audioContext.createMediaStreamDestination();
+  localMicSource.connect(localMicGain).connect(localMicDestination);
+  localAudioStream = localMicDestination.stream;
+  updateMuteButton();
+  return localAudioStream;
+}
+
+function updateAudioListenerPosition() {
+  if (!audioContext) {
+    return;
+  }
+  const listener = audioContext.listener;
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  camera.getWorldPosition(position);
+  camera.getWorldQuaternion(quaternion);
+
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quaternion);
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+
+  const time = audioContext.currentTime;
+  if (listener.positionX) {
+    listener.positionX.setValueAtTime(position.x, time);
+    listener.positionY.setValueAtTime(position.y, time);
+    listener.positionZ.setValueAtTime(position.z, time);
+    listener.forwardX.setValueAtTime(forward.x, time);
+    listener.forwardY.setValueAtTime(forward.y, time);
+    listener.forwardZ.setValueAtTime(forward.z, time);
+    listener.upX.setValueAtTime(up.x, time);
+    listener.upY.setValueAtTime(up.y, time);
+    listener.upZ.setValueAtTime(up.z, time);
+  } else if (listener.setPosition) {
+    listener.setPosition(position.x, position.y, position.z);
+    listener.setOrientation(forward.x, forward.y, forward.z, up.x, up.y, up.z);
+  }
+}
+
+function setupRemoteAudio(peerId, stream, trackId) {
+  if (!audioContext || !stream) {
+    return;
+  }
+  const existing = remoteAudioNodes.get(peerId);
+  if (existing && existing.trackId === trackId) {
+    return;
+  }
+  if (existing) {
+    cleanupPeerAudio(peerId);
+  }
+
+  const source = audioContext.createMediaStreamSource(stream);
+  const analyser = audioContext.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.8;
+
+  const panner = audioContext.createPanner();
+  panner.panningModel = AUDIO_CONFIG.panningModel;
+  panner.distanceModel = AUDIO_CONFIG.distanceModel;
+  panner.refDistance = AUDIO_CONFIG.refDistance;
+  panner.maxDistance = AUDIO_CONFIG.maxDistance;
+  panner.rolloffFactor = AUDIO_CONFIG.rolloffFactor;
+
+  const gain = audioContext.createGain();
+  gain.gain.value = 1;
+
+  source.connect(analyser).connect(panner).connect(gain).connect(masterGain);
+
+  const nodeState = {
+    source,
+    analyser,
+    panner,
+    gain,
+    trackId,
+    level: 0,
+    data: new Uint8Array(analyser.frequencyBinCount),
+    volume: 1,
+    muted: false,
+    prevVolume: 1
+  };
+
+  remoteAudioNodes.set(peerId, nodeState);
+  syncPeerVolumeUI(peerId);
+}
+
+function cleanupPeerAudio(peerId) {
+  const node = remoteAudioNodes.get(peerId);
+  if (!node) {
+    return;
+  }
+  node.source.disconnect();
+  node.analyser.disconnect();
+  node.panner.disconnect();
+  node.gain.disconnect();
+  remoteAudioNodes.delete(peerId);
+}
+
+function getAudioLevel(peerId) {
+  const node = remoteAudioNodes.get(peerId);
+  if (!node) {
+    return 0;
+  }
+  node.analyser.getByteFrequencyData(node.data);
+  let sum = 0;
+  for (let i = 0; i < node.data.length; i += 1) {
+    sum += node.data[i];
+  }
+  const avg = sum / node.data.length / 255;
+  node.level = node.level * 0.85 + avg * 0.15;
+  return node.level;
+}
+
+function updateSpeakingIndicators() {
+  remoteAvatars.forEach((avatar, peerId) => {
+    const level = getAudioLevel(peerId);
+    if (avatar.boardMaterial) {
+      avatar.boardMaterial.emissiveIntensity = Math.min(level * 3.5, 1.6);
+    }
+    if (avatar.meter) {
+      avatar.meter.visible = level > 0.02;
+      avatar.meter.scale.x = Math.max(0.08, level * 1.4);
+      avatar.meter.material.opacity = 0.3 + level * 0.7;
+    }
+  });
+}
+
+function updatePeerAudioPosition(peerId, position) {
+  const node = remoteAudioNodes.get(peerId);
+  if (!node || !audioContext) {
+    return;
+  }
+  const time = audioContext.currentTime;
+  if (node.panner.positionX) {
+    node.panner.positionX.setValueAtTime(position.x, time);
+    node.panner.positionY.setValueAtTime(position.y, time);
+    node.panner.positionZ.setValueAtTime(position.z, time);
+  } else if (node.panner.setPosition) {
+    node.panner.setPosition(position.x, position.y, position.z);
+  }
+}
+
+function setMasterVolume(value) {
+  if (masterGain) {
+    masterGain.gain.value = value;
+  }
+}
+
+function toggleLocalMute() {
+  if (!localMicGain) {
+    return;
+  }
+  isMuted = !isMuted;
+  localMicGain.gain.value = isMuted ? 0 : 1;
+  updateMuteButton();
+}
+
+function updateMuteButton() {
+  if (!muteBtn) {
+    return;
+  }
+  muteBtn.textContent = isMuted ? 'Unmute Mic' : 'Mute Mic';
+  muteBtn.classList.toggle('muted', isMuted);
+}
+
+function setPeerVolume(peerId, value) {
+  const node = remoteAudioNodes.get(peerId);
+  if (!node) {
+    return;
+  }
+  node.gain.gain.value = value;
+  node.volume = value;
+  if (value > 0) {
+    node.prevVolume = value;
+    node.muted = false;
+  } else {
+    node.muted = true;
+  }
+}
+
+function togglePeerMute(peerId) {
+  const node = remoteAudioNodes.get(peerId);
+  if (!node) {
+    return;
+  }
+  if (node.muted) {
+    const restore = node.prevVolume || 1;
+    setPeerVolume(peerId, restore);
+    node.muted = false;
+  } else {
+    node.prevVolume = node.volume || 1;
+    setPeerVolume(peerId, 0);
+    node.muted = true;
+  }
+}
+
+function syncPeerVolumeUI(peerId) {
+  if (!selectedPeerId || selectedPeerId !== peerId) {
+    return;
+  }
+  const node = remoteAudioNodes.get(peerId);
+  if (!node) {
+    return;
+  }
+  peerVolume.value = node.gain.gain.value.toFixed(2);
+  mutePeerBtn.textContent = node.muted ? 'Unmute' : 'Mute';
+}
+
+function openVolumePopup(peerId) {
+  const avatar = remoteAvatars.get(peerId);
+  const node = remoteAudioNodes.get(peerId);
+  if (!avatar || !node) {
+    hideVolumePopup();
+    return;
+  }
+  selectedPeerId = peerId;
+  popupPeerName.textContent = `Peer ${peerId.slice(0, 6)}`;
+  peerVolume.value = node.gain.gain.value.toFixed(2);
+  mutePeerBtn.textContent = node.muted ? 'Unmute' : 'Mute';
+  volumePopup.classList.remove('hidden');
+  updateVolumePopupPosition();
+}
+
+function hideVolumePopup() {
+  selectedPeerId = null;
+  volumePopup.classList.add('hidden');
+}
+
+function updateVolumePopupPosition() {
+  if (!selectedPeerId || volumePopup.classList.contains('hidden')) {
+    return;
+  }
+  const avatar = remoteAvatars.get(selectedPeerId);
+  if (!avatar) {
+    hideVolumePopup();
+    return;
+  }
+  const worldPos = avatar.group.position.clone();
+  worldPos.y += 0.9;
+  const projected = worldPos.project(camera);
+  const x = (projected.x * 0.5 + 0.5) * window.innerWidth;
+  const y = (-projected.y * 0.5 + 0.5) * window.innerHeight;
+  volumePopup.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
+}
+
 function initScene() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x87c9ff);
@@ -100,16 +554,19 @@ function initScene() {
     70,
     window.innerWidth / window.innerHeight,
     0.1,
-    400
+    260
   );
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer = new THREE.WebGLRenderer({
+    antialias: false,
+    powerPreference: 'high-performance'
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_PIXEL_RATIO));
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.body.appendChild(renderer.domElement);
 
   controls = new PointerLockControls(camera, renderer.domElement);
-  controls.getObject().position.set(0, 1.6, 18);
+  controls.getObject().position.set(0, STANDING_HEIGHT, 18);
   scene.add(controls.getObject());
 
   clock = new THREE.Clock();
@@ -140,6 +597,7 @@ function initScene() {
     if (!moveShareMode) {
       controlsHint.textContent = 'WASD to move - ESC to release';
     }
+    hideVolumePopup();
   });
 
   controls.addEventListener('unlock', () => {
@@ -155,37 +613,51 @@ function initScene() {
 
 async function joinExperience() {
   joinBtn.disabled = true;
-  statusEl.textContent = 'Requesting camera...';
+  statusEl.textContent = 'Requesting camera + mic...';
+  initAudioContext();
+  await resumeAudioContext();
 
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({
+    localMediaStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width: 640,
-        height: 480
+        width: { ideal: 320, max: 640 },
+        height: { ideal: 240, max: 480 },
+        frameRate: { ideal: 24, max: 30 }
       },
-      audio: false
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
     });
   } catch (err) {
-    statusEl.textContent = 'Camera access denied';
+    statusEl.textContent = 'Camera/mic access denied';
     joinBtn.disabled = false;
     return;
   }
 
-  localVideo.srcObject = localStream;
+  localStream = new MediaStream(localMediaStream.getVideoTracks());
+  localVideo.srcObject = localMediaStream;
   playVideoElement(localVideo);
+  createLocalAudioStream(localMediaStream);
   overlay.classList.add('hidden');
   joined = true;
   shareBtn.disabled = false;
+  muteBtn.disabled = false;
+  masterVolume.disabled = false;
   connectSocket();
 }
 
 function connectSocket() {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  socket = new WebSocket(`${protocol}://${window.location.host}`);
+  const room = sanitizeRoomCode(roomInput.value) || generateLobbyCode();
+  setRoomCode(room, true);
+  const wsUrl = new URL(`${protocol}://${window.location.host}/ws`);
+  wsUrl.searchParams.set('room', room);
+  socket = new WebSocket(wsUrl.toString());
 
   socket.addEventListener('open', () => {
-    statusEl.textContent = 'Connected to room';
-    const room = roomInput.value.trim() || 'lobby';
+    statusEl.textContent = `Connected to ${room}`;
     socket.send(JSON.stringify({ type: 'join', room }));
     hasJoinedRoom = true;
     if (screenStream && pendingShareStart) {
@@ -302,6 +774,12 @@ function createPeerConnection(peerId) {
     });
   }
 
+  if (localAudioStream) {
+    localAudioStream.getAudioTracks().forEach((track) => {
+      pc.addTrack(track, localAudioStream);
+    });
+  }
+
   if (screenStream) {
     screenStream.getVideoTracks().forEach((track) => {
       pc.addTrack(track, screenStream);
@@ -311,7 +789,17 @@ function createPeerConnection(peerId) {
   pc.ontrack = (event) => {
     const [stream] = event.streams;
     const track = event.track;
-    if (!stream || !track || track.kind !== 'video') {
+    if (!track) {
+      return;
+    }
+
+    if (track.kind === 'audio') {
+      const audioStream = new MediaStream([track]);
+      setupRemoteAudio(peerId, audioStream, track.id);
+      return;
+    }
+
+    if (!stream || track.kind !== 'video') {
       return;
     }
 
@@ -422,6 +910,9 @@ function playVideoElement(video) {
 
 function createVideoTexture(video) {
   const texture = new THREE.VideoTexture(video);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
   if (texture.colorSpace !== undefined) {
     texture.colorSpace = THREE.SRGBColorSpace;
   }
@@ -475,7 +966,9 @@ function ensureRemoteAvatar(peerId) {
   const boardMat = new THREE.MeshStandardMaterial({
     color: 0x2f3740,
     roughness: 0.6,
-    metalness: 0.1
+    metalness: 0.1,
+    emissive: new THREE.Color(0x36c6b4),
+    emissiveIntensity: 0
   });
   const board = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.9, 0.08), boardMat);
   group.add(board);
@@ -487,13 +980,29 @@ function ensureRemoteAvatar(peerId) {
   screen.position.z = 0.041;
   group.add(screen);
 
+  const meterMat = new THREE.MeshBasicMaterial({
+    color: 0x36c6b4,
+    transparent: true,
+    opacity: 0.0
+  });
+  const meter = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.06, 0.02), meterMat);
+  meter.position.set(0, 0.55, 0.05);
+  meter.scale.x = 0.01;
+  meter.visible = false;
+  group.add(meter);
+
   scene.add(group);
 
   const avatar = {
     group,
     screen,
-    texture: null
+    texture: null,
+    boardMaterial: boardMat,
+    meter,
+    hitbox: board
   };
+
+  board.userData.peerId = peerId;
 
   remoteAvatars.set(peerId, avatar);
   return avatar;
@@ -503,6 +1012,7 @@ function updateRemotePose(peerId, position, rotation) {
   const avatar = ensureRemoteAvatar(peerId);
   avatar.group.position.set(position.x, position.y, position.z);
   avatar.group.rotation.set(rotation.x || 0, (rotation.y || 0) + Math.PI, 0);
+  updatePeerAudioPosition(peerId, avatar.group.position);
 }
 
 function cleanupPeer(peerId) {
@@ -520,6 +1030,8 @@ function cleanupPeer(peerId) {
     scene.remove(avatar.group);
     remoteAvatars.delete(peerId);
   }
+
+  cleanupPeerAudio(peerId);
 
   const video = remoteVideos.get(peerId);
   if (video) {
@@ -545,6 +1057,9 @@ function cleanupPeer(peerId) {
   remoteShareMeta.delete(peerId);
   remoteTrackStreams.delete(peerId);
   remoteAvatarTrackIds.delete(peerId);
+  if (selectedPeerId === peerId) {
+    hideVolumePopup();
+  }
 }
 
 async function startScreenShare() {
@@ -555,7 +1070,11 @@ async function startScreenShare() {
   shareBtn.disabled = true;
   try {
     screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
+      video: {
+        width: { max: 1280 },
+        height: { max: 720 },
+        frameRate: { ideal: 20, max: 30 }
+      },
       audio: false
     });
   } catch (err) {
@@ -570,6 +1089,15 @@ async function startScreenShare() {
   }
 
   screenTrackId = track.id;
+  try {
+    await track.applyConstraints({
+      width: 1280,
+      height: 720,
+      frameRate: 20
+    });
+  } catch (err) {
+    // Ignore unsupported constraints.
+  }
   track.onended = () => {
     stopScreenShare();
   };
@@ -664,6 +1192,7 @@ function toggleMoveShare(forceState) {
       controls.unlock();
     }
     controlsHint.textContent = 'Drag the screen to move it';
+    hideVolumePopup();
   } else {
     controlsHint.textContent = controls.isLocked
       ? 'WASD to move - ESC to release'
@@ -893,7 +1422,7 @@ function createSharePanel() {
     color: 0x31363b,
     roughness: 0.8
   });
-  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.6, 0.18, 12), baseMat);
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.6, 0.18, 8), baseMat);
   base.position.set(0, -1.3, 0);
   group.add(base);
 
@@ -941,25 +1470,57 @@ function orientPanelToCamera(panel, target) {
   panel.group.rotateY(Math.PI);
 }
 
-function onPointerDown(event) {
-  if (!moveShareMode || !localSharePanel) {
-    return;
-  }
+function getAvatarHit(event) {
   updatePointer(event);
   raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObject(localSharePanel.hitbox, true);
+  const hitboxes = [];
+  remoteAvatars.forEach((avatar) => {
+    if (avatar.hitbox) {
+      hitboxes.push(avatar.hitbox);
+    }
+  });
+  const hits = raycaster.intersectObjects(hitboxes, false);
   if (!hits.length) {
+    return null;
+  }
+  const hit = hits[0].object;
+  return hit.userData.peerId || null;
+}
+
+function onPointerDown(event) {
+  if (moveShareMode) {
+    if (!localSharePanel) {
+      return;
+    }
+    updatePointer(event);
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObject(localSharePanel.hitbox, true);
+    if (!hits.length) {
+      return;
+    }
+
+    draggingShare = true;
+    shareDragPlane.constant = -localSharePanel.group.position.y;
+    if (raycaster.ray.intersectPlane(shareDragPlane, shareDragPoint)) {
+      shareDragOffset.copy(localSharePanel.group.position).sub(shareDragPoint);
+    } else {
+      shareDragOffset.set(0, 0, 0);
+    }
+    renderer.domElement.style.cursor = 'grabbing';
     return;
   }
 
-  draggingShare = true;
-  shareDragPlane.constant = -localSharePanel.group.position.y;
-  if (raycaster.ray.intersectPlane(shareDragPlane, shareDragPoint)) {
-    shareDragOffset.copy(localSharePanel.group.position).sub(shareDragPoint);
-  } else {
-    shareDragOffset.set(0, 0, 0);
+  if (!joined || controls.isLocked) {
+    hideVolumePopup();
+    return;
   }
-  renderer.domElement.style.cursor = 'grabbing';
+
+  const hit = getAvatarHit(event);
+  if (hit) {
+    openVolumePopup(hit);
+  } else {
+    hideVolumePopup();
+  }
 }
 
 function onPointerMove(event) {
@@ -1021,8 +1582,9 @@ function maybeSendPose() {
   socket.send(
     JSON.stringify({
       type: 'pose',
-      position: { x: pos.x, y: pos.y, z: pos.z },
-      rotation: { x: pitch, y: yaw }
+      position: { x: pos.x, y: currentHeight, z: pos.z },
+      rotation: { x: pitch, y: yaw },
+      crouch: moveState.crouch
     })
   );
 }
@@ -1051,10 +1613,27 @@ function animate() {
 
     controls.moveRight(-velocity.x * delta);
     controls.moveForward(-velocity.z * delta);
-    controls.getObject().position.y = 1.6;
+    let targetHeight = moveState.crouch ? CROUCH_HEIGHT : STANDING_HEIGHT;
+
+    if (moveState.jumping) {
+      const jumpElapsed = (performance.now() - jumpStartTime) / 1000;
+      if (jumpElapsed < JUMP_DURATION) {
+        const jumpProgress = jumpElapsed / JUMP_DURATION;
+        const jumpOffset = JUMP_HEIGHT * Math.sin(jumpProgress * Math.PI);
+        targetHeight += jumpOffset;
+      } else {
+        moveState.jumping = false;
+      }
+    }
+
+    currentHeight = targetHeight;
+    controls.getObject().position.y = currentHeight;
   }
 
+  updateAudioListenerPosition();
   updateShareFacing();
+  updateSpeakingIndicators();
+  updateVolumePopupPosition();
   maybeSendPose();
   renderer.render(scene, camera);
 }
@@ -1083,6 +1662,16 @@ function onKeyDown(event) {
     case 'ArrowRight':
       moveState.right = true;
       break;
+    case 'ShiftLeft':
+    case 'ShiftRight':
+      moveState.crouch = true;
+      break;
+    case 'Space':
+      if (!moveState.jumping) {
+        moveState.jumping = true;
+        jumpStartTime = performance.now();
+      }
+      break;
     default:
       break;
   }
@@ -1105,6 +1694,10 @@ function onKeyUp(event) {
     case 'KeyD':
     case 'ArrowRight':
       moveState.right = false;
+      break;
+    case 'ShiftLeft':
+    case 'ShiftRight':
+      moveState.crouch = false;
       break;
     default:
       break;
@@ -1362,7 +1955,7 @@ function createChair() {
     roughness: 0.8
   });
 
-  const seat = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.45, 0.12, 12), seatMat);
+  const seat = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.45, 0.12, 8), seatMat);
   seat.position.y = 0.6;
   chair.add(seat);
 
@@ -1371,7 +1964,7 @@ function createChair() {
   chair.add(back);
 
   const post = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.08, 0.08, 0.6, 8),
+    new THREE.CylinderGeometry(0.08, 0.08, 0.6, 6),
     new THREE.MeshStandardMaterial({ color: 0x1a2228, roughness: 0.7 })
   );
   post.position.y = 0.3;
@@ -1406,7 +1999,7 @@ function createOutdoorAccents() {
     roughness: 0.4,
     metalness: 0.2
   });
-  const sculpture = new THREE.Mesh(new THREE.TorusGeometry(3.5, 0.2, 12, 48), sculptureMat);
+  const sculpture = new THREE.Mesh(new THREE.TorusGeometry(3.5, 0.2, 8, 24), sculptureMat);
   sculpture.position.set(-12, 3.5, 10);
   sculpture.rotation.x = Math.PI / 2.8;
   scene.add(sculpture);
@@ -1415,7 +2008,7 @@ function createOutdoorAccents() {
     color: 0x2b3b2f,
     roughness: 0.8
   });
-  const planter = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.6, 1, 16), planterMat);
+  const planter = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.6, 1, 10), planterMat);
   planter.position.set(12, 0.5, 6);
   scene.add(planter);
 
@@ -1423,7 +2016,7 @@ function createOutdoorAccents() {
     color: 0x3a7a3a,
     roughness: 0.9
   });
-  const leaves = new THREE.Mesh(new THREE.SphereGeometry(2, 12, 12), leavesMat);
+  const leaves = new THREE.Mesh(new THREE.SphereGeometry(2, 8, 8), leavesMat);
   leaves.position.set(12, 2.4, 6);
   scene.add(leaves);
 }
