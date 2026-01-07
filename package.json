@@ -6,13 +6,15 @@
   "scripts": {
     "start": "node server.js",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "proto": "pbjs -t static-module -w es6 -o public/proto/pose.js public/proto/pose.proto"
   },
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.16.0"
   },
   "devDependencies": {
+    "protobufjs-cli": "^1.1.2",
     "wrangler": "^3.90.0"
   }
 }

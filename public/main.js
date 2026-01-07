@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { PoseMessage } from './proto/pose.js';
 
 const overlay = document.getElementById('overlay');
 const joinBtn = document.getElementById('joinBtn');
@@ -47,6 +48,8 @@ let pendingShareStart = false;
 let isMuted = false;
 
 const peerConnections = new Map();
+const poseChannels = new Map();
+const poseInterpolators = new Map();
 const remoteAvatars = new Map();
 const remoteVideos = new Map();
 const remoteSharePanels = new Map();
@@ -699,7 +702,31 @@ function connectSocket() {
 
     if (msg.type === 'peer-joined') {
       if (msg.id && msg.id !== myId) {
-        ensureRemoteAvatar(msg.id);
+        const peerId = msg.id;
+        ensureRemoteAvatar(peerId);
+        if (localSharePanel && screenStream) {
+          const pos = localSharePanel.group.position;
+          const poseMsg = PoseMessage.create({
+            type: 1,
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+            timestamp: performance.now() & 0xffffffff
+          });
+          const buffer = PoseMessage.encode(poseMsg).finish();
+          const checkAndSend = () => {
+            if (!localSharePanel || !screenStream) {
+              return;
+            }
+            const channel = poseChannels.get(peerId);
+            if (channel?.readyState === 'open') {
+              channel.send(buffer);
+              return;
+            }
+            setTimeout(checkAndSend, 100);
+          };
+          setTimeout(checkAndSend, 500);
+        }
       }
       return;
     }
@@ -723,13 +750,6 @@ function connectSocket() {
       return;
     }
 
-    if (msg.type === 'screenpose') {
-      if (msg.id && msg.id !== myId && msg.position) {
-        updateRemoteSharePose(msg.id, msg.position);
-      }
-      return;
-    }
-
     if (msg.type === 'offer') {
       await handleOffer(msg.from, msg.sdp);
       return;
@@ -745,11 +765,6 @@ function connectSocket() {
       return;
     }
 
-    if (msg.type === 'pose') {
-      if (msg.id !== myId && msg.position && msg.rotation) {
-        updateRemotePose(msg.id, msg.position, msg.rotation);
-      }
-    }
   });
 
   socket.addEventListener('close', () => {
@@ -759,7 +774,22 @@ function connectSocket() {
   });
 }
 
-function createPeerConnection(peerId) {
+function registerPoseChannel(peerId, channel) {
+  if (!channel) {
+    return;
+  }
+  channel.binaryType = 'arraybuffer';
+  channel.onopen = () => console.log(`Pose channel open: ${peerId}`);
+  channel.onmessage = (event) => handlePoseMessage(peerId, event.data);
+  channel.onclose = () => {
+    if (poseChannels.get(peerId) === channel) {
+      poseChannels.delete(peerId);
+    }
+  };
+  poseChannels.set(peerId, channel);
+}
+
+function createPeerConnection(peerId, isInitiator = false) {
   if (peerConnections.has(peerId)) {
     return peerConnections.get(peerId);
   }
@@ -785,6 +815,20 @@ function createPeerConnection(peerId) {
       pc.addTrack(track, screenStream);
     });
   }
+
+  if (isInitiator) {
+    const channel = pc.createDataChannel('pose', {
+      ordered: false,
+      maxRetransmits: 0
+    });
+    registerPoseChannel(peerId, channel);
+  }
+
+  pc.ondatachannel = (event) => {
+    if (event.channel.label === 'pose') {
+      registerPoseChannel(peerId, event.channel);
+    }
+  };
 
   pc.ontrack = (event) => {
     const [stream] = event.streams;
@@ -837,7 +881,7 @@ function createPeerConnection(peerId) {
 }
 
 async function createOffer(peerId) {
-  const pc = createPeerConnection(peerId);
+  const pc = createPeerConnection(peerId, true);
   if (pc.signalingState !== 'stable') {
     return;
   }
@@ -854,7 +898,7 @@ async function handleOffer(peerId, sdp) {
   if (!peerId || !sdp) {
     return;
   }
-  const pc = createPeerConnection(peerId);
+  const pc = createPeerConnection(peerId, false);
   await pc.setRemoteDescription(new RTCSessionDescription(sdp));
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
@@ -1057,6 +1101,12 @@ function cleanupPeer(peerId) {
   remoteShareMeta.delete(peerId);
   remoteTrackStreams.delete(peerId);
   remoteAvatarTrackIds.delete(peerId);
+  const channel = poseChannels.get(peerId);
+  if (channel) {
+    channel.close();
+    poseChannels.delete(peerId);
+  }
+  poseInterpolators.delete(peerId);
   if (selectedPeerId === peerId) {
     hideVolumePopup();
   }
@@ -1238,7 +1288,7 @@ function sendShareStop() {
 }
 
 function sendScreenPose(force) {
-  if (!localSharePanel || !socket || socket.readyState !== WebSocket.OPEN) {
+  if (!localSharePanel) {
     return;
   }
 
@@ -1253,12 +1303,19 @@ function sendScreenPose(force) {
   lastSharePosition.copy(pos);
   lastShareSent = now;
 
-  socket.send(
-    JSON.stringify({
-      type: 'screenpose',
-      position: { x: pos.x, y: pos.y, z: pos.z }
-    })
-  );
+  const poseMsg = PoseMessage.create({
+    type: 1,
+    x: pos.x,
+    y: pos.y,
+    z: pos.z,
+    timestamp: performance.now() & 0xffffffff
+  });
+  const buffer = PoseMessage.encode(poseMsg).finish();
+  poseChannels.forEach((channel) => {
+    if (channel.readyState === 'open') {
+      channel.send(buffer);
+    }
+  });
 }
 
 function handleShareStart(share) {
@@ -1324,6 +1381,80 @@ function updateRemoteSharePose(peerId, position) {
   }
   const panel = ensureRemoteSharePanel(peerId);
   panel.group.position.set(position.x, position.y, position.z);
+}
+
+function handlePoseMessage(peerId, data) {
+  if (!data) {
+    return;
+  }
+  let msg;
+  try {
+    msg = PoseMessage.decode(new Uint8Array(data));
+  } catch (err) {
+    return;
+  }
+
+  if (msg.type === 0) {
+    let interp = poseInterpolators.get(peerId);
+    if (!interp) {
+      interp = { poses: [], maxPoses: 5 };
+      poseInterpolators.set(peerId, interp);
+    }
+    interp.poses.push({ pose: msg, time: performance.now() });
+    if (interp.poses.length > interp.maxPoses) {
+      interp.poses.shift();
+    }
+    return;
+  }
+
+  if (msg.type === 1) {
+    updateRemoteSharePose(peerId, { x: msg.x, y: msg.y, z: msg.z });
+  }
+}
+
+function updateInterpolatedAvatars() {
+  const now = performance.now();
+  const bufferMs = 100;
+
+  remoteAvatars.forEach((avatar, peerId) => {
+    const interp = poseInterpolators.get(peerId);
+    if (!interp || interp.poses.length === 0) {
+      return;
+    }
+
+    if (interp.poses.length === 1) {
+      const p = interp.poses[0].pose;
+      avatar.group.position.set(p.x, p.y, p.z);
+      avatar.group.rotation.set(p.pitch || 0, (p.yaw || 0) + Math.PI, 0);
+      updatePeerAudioPosition(peerId, avatar.group.position);
+      return;
+    }
+
+    const targetTime = now - bufferMs;
+    let p0 = interp.poses[0];
+    let p1 = interp.poses[1];
+    for (let i = 1; i < interp.poses.length; i += 1) {
+      if (interp.poses[i].time > targetTime) {
+        p0 = interp.poses[i - 1];
+        p1 = interp.poses[i];
+        break;
+      }
+      p0 = interp.poses[i];
+      p1 = interp.poses[i];
+    }
+
+    const span = p1.time - p0.time || 1;
+    const t = Math.max(0, Math.min(1, (targetTime - p0.time) / span));
+    const x = p0.pose.x + (p1.pose.x - p0.pose.x) * t;
+    const y = p0.pose.y + (p1.pose.y - p0.pose.y) * t;
+    const z = p0.pose.z + (p1.pose.z - p0.pose.z) * t;
+    const yaw = p0.pose.yaw + (p1.pose.yaw - p0.pose.yaw) * t;
+    const pitch = p0.pose.pitch + (p1.pose.pitch - p0.pose.pitch) * t;
+
+    avatar.group.position.set(x, y, z);
+    avatar.group.rotation.set(pitch, yaw + Math.PI, 0);
+    updatePeerAudioPosition(peerId, avatar.group.position);
+  });
 }
 
 function resetAvatarScreen(peerId) {
@@ -1552,7 +1683,7 @@ function updatePointer(event) {
 }
 
 function maybeSendPose() {
-  if (!joined || !socket || socket.readyState !== WebSocket.OPEN) {
+  if (!joined) {
     return;
   }
 
@@ -1579,14 +1710,22 @@ function maybeSendPose() {
   lastPose.pitch = pitch;
   lastPoseSent = now;
 
-  socket.send(
-    JSON.stringify({
-      type: 'pose',
-      position: { x: pos.x, y: currentHeight, z: pos.z },
-      rotation: { x: pitch, y: yaw },
-      crouch: moveState.crouch
-    })
-  );
+  const poseMsg = PoseMessage.create({
+    type: 0,
+    x: pos.x,
+    y: currentHeight,
+    z: pos.z,
+    yaw,
+    pitch,
+    flags: moveState.crouch ? 1 : 0,
+    timestamp: performance.now() & 0xffffffff
+  });
+  const buffer = PoseMessage.encode(poseMsg).finish();
+  poseChannels.forEach((channel) => {
+    if (channel.readyState === 'open') {
+      channel.send(buffer);
+    }
+  });
 }
 
 function animate() {
@@ -1631,6 +1770,7 @@ function animate() {
   }
 
   updateAudioListenerPosition();
+  updateInterpolatedAvatars();
   updateShareFacing();
   updateSpeakingIndicators();
   updateVolumePopupPosition();

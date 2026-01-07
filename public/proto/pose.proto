@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+enum MessageType {
+  AVATAR_POSE = 0;
+  SCREEN_POSE = 1;
+}
+
+message PoseMessage {
+  MessageType type = 1;
+  float x = 2;
+  float y = 3;
+  float z = 4;
+  float yaw = 5;
+  float pitch = 6;
+  uint32 flags = 7;      // bit 0: crouch
+  uint32 timestamp = 8;  // for interpolation
+}

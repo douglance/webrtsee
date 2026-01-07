@@ -125,19 +125,6 @@ export class Room {
       return;
     }
 
-    if (msg.type === 'pose') {
-      this.broadcast(
-        {
-          type: 'pose',
-          id: clientId,
-          position: msg.position,
-          rotation: msg.rotation
-        },
-        clientId
-      );
-      return;
-    }
-
     if (msg.type === 'share-start') {
       if (!msg.trackId) {
         return;
@@ -162,22 +149,6 @@ export class Room {
     if (msg.type === 'share-stop') {
       this.shares.delete(clientId);
       this.broadcast({ type: 'share-stop', id: clientId }, clientId);
-      return;
-    }
-
-    if (msg.type === 'screenpose') {
-      const share = this.shares.get(clientId);
-      if (share && msg.position) {
-        share.position = msg.position;
-      }
-      this.broadcast(
-        {
-          type: 'screenpose',
-          id: clientId,
-          position: msg.position
-        },
-        clientId
-      );
       return;
     }
 

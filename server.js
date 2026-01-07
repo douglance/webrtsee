@@ -89,23 +89,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (msg.type === 'pose') {
-      if (!ws.room) {
-        return;
-      }
-      broadcast(
-        ws.room,
-        {
-          type: 'pose',
-          id: ws.id,
-          position: msg.position,
-          rotation: msg.rotation
-        },
-        ws.id
-      );
-      return;
-    }
-
     if (msg.type === 'share-start') {
       if (!ws.room || !msg.trackId) {
         return;
@@ -134,26 +117,6 @@ wss.on('connection', (ws) => {
       }
       shares.delete(ws.id);
       broadcast(ws.room, { type: 'share-stop', id: ws.id }, ws.id);
-      return;
-    }
-
-    if (msg.type === 'screenpose') {
-      if (!ws.room) {
-        return;
-      }
-      const share = shares.get(ws.id);
-      if (share && msg.position) {
-        share.position = msg.position;
-      }
-      broadcast(
-        ws.room,
-        {
-          type: 'screenpose',
-          id: ws.id,
-          position: msg.position
-        },
-        ws.id
-      );
       return;
     }
 
