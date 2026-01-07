@@ -1,6 +1,14 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { PoseMessage } from './proto/pose.js';
+import {
+  avatarQuatFacingCamera,
+  cameraForwardFromYawPitch,
+  clampPitchRad,
+  forwardFromQuat,
+  normalizeAngleRad,
+  yawPitchFromCameraForward
+} from './pose_math.mjs';
 
 const overlay = document.getElementById('overlay');
 const joinBtn = document.getElementById('joinBtn');
@@ -30,6 +38,18 @@ const AUDIO_CONFIG = {
   maxDistance: 50.0,
   rolloffFactor: 1.5
 };
+const DEBUG_VIEW_DEFAULT = false;
+const DEBUG_PLANE_SIZE = 24;
+const DEBUG_GRID_DIVS = 24;
+const DEBUG_ARROW_LEN = 1.6;
+const DEBUG_ARROW_OFFSET = 0.25;
+
+function lerpAngle(a, b, t) {
+  let delta = b - a;
+  while (delta > Math.PI) delta -= 2 * Math.PI;
+  while (delta < -Math.PI) delta += 2 * Math.PI;
+  return a + delta * t;
+}
 
 let scene;
 let camera;
@@ -91,13 +111,57 @@ const moveState = {
 };
 const STANDING_HEIGHT = 1.6;
 const CROUCH_HEIGHT = 0.9;
+const CROUCH_DURATION = 0.35;
 const JUMP_HEIGHT = 0.8;
-const JUMP_DURATION = 0.4;
+const JUMP_TICK = 1 / 20;
+const JUMP_VELOCITY = 0.42;
+const JUMP_GRAVITY = 0.08;
+const JUMP_DRAG = 0.98;
+const MC_JUMP_PEAK = 1.2522;
+const JUMP_SCALE = JUMP_HEIGHT / MC_JUMP_PEAK;
 
-let jumpStartTime = 0;
+let jumpVelocity = 0;
+let jumpOffset = 0;
+let jumpAccumulator = 0;
+let crouchStartTime = 0;
+let currentBaseHeight = STANDING_HEIGHT;
+let crouchFromHeight = STANDING_HEIGHT;
+let crouchTargetHeight = STANDING_HEIGHT;
+let crouchTransitionActive = false;
 let currentHeight = STANDING_HEIGHT;
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
+const cameraForward = new THREE.Vector3();
+const cameraYawPitch = { yaw: 0, pitch: 0 };
+const avatarQuatOut = { x: 0, y: 0, z: 0, w: 1 };
+const avatarYawQuat = { x: 0, y: 0, z: 0, w: 1 };
+const avatarPitchQuat = { x: 0, y: 0, z: 0, w: 1 };
+const debugRemoteState = new Map();
+const debugCameraQuat = new THREE.Quaternion();
+const debugCameraForward = new THREE.Vector3();
+const debugAvatarForwardVec = new THREE.Vector3();
+const debugExpectedForwardVec = new THREE.Vector3();
+const debugLocalExpected = { x: 0, y: 0, z: 0 };
+const debugRemoteExpected = { x: 0, y: 0, z: 0 };
+const debugRemoteActual = { x: 0, y: 0, z: 0 };
+const debugLocalState = {
+  rawYaw: 0,
+  rawPitch: 0,
+  yaw: 0,
+  pitch: 0,
+  yawNorm: 0,
+  pitchClamp: 0
+};
+const debugView = {
+  overlay: null,
+  group: null,
+  localArrow: null,
+  remoteArrow: null,
+  remoteExpectedArrow: null,
+  localAxes: null,
+  remoteAxes: null
+};
+let debugEnabled = DEBUG_VIEW_DEFAULT;
 
 const lastPose = {
   position: new THREE.Vector3(),
@@ -192,6 +256,365 @@ moveShareBtn.addEventListener('click', () => {
   }
   toggleMoveShare();
 });
+
+function setupDebugView() {
+  if (debugView.group || debugView.overlay) {
+    return;
+  }
+
+  const overlayEl = document.createElement('pre');
+  overlayEl.id = 'debugOverlay';
+  overlayEl.style.cssText =
+    'position:fixed;top:8px;left:8px;z-index:1000;' +
+    'background:rgba(0,0,0,0.65);color:#8effc1;' +
+    'font:12px/1.4 monospace;padding:8px 10px;' +
+    'pointer-events:none;white-space:pre;max-width:45vw;';
+  document.body.appendChild(overlayEl);
+  debugView.overlay = overlayEl;
+
+  const group = new THREE.Group();
+  group.name = 'debug-helpers';
+
+  const axes = new THREE.AxesHelper(4);
+  group.add(axes);
+
+  const gridXZ = new THREE.GridHelper(DEBUG_PLANE_SIZE, DEBUG_GRID_DIVS, 0x3a3a3a, 0x1f1f1f);
+  group.add(gridXZ);
+
+  const gridXY = new THREE.GridHelper(DEBUG_PLANE_SIZE, DEBUG_GRID_DIVS, 0x3a3a3a, 0x1f1f1f);
+  gridXY.rotation.x = Math.PI / 2;
+  group.add(gridXY);
+
+  const gridYZ = new THREE.GridHelper(DEBUG_PLANE_SIZE, DEBUG_GRID_DIVS, 0x3a3a3a, 0x1f1f1f);
+  gridYZ.rotation.z = Math.PI / 2;
+  group.add(gridYZ);
+
+  const planeMaterial = (color) =>
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.06,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    });
+
+  const planeXY = new THREE.Mesh(
+    new THREE.PlaneGeometry(DEBUG_PLANE_SIZE, DEBUG_PLANE_SIZE),
+    planeMaterial(0xff4444)
+  );
+  group.add(planeXY);
+
+  const planeXZ = new THREE.Mesh(
+    new THREE.PlaneGeometry(DEBUG_PLANE_SIZE, DEBUG_PLANE_SIZE),
+    planeMaterial(0x4444ff)
+  );
+  planeXZ.rotation.x = -Math.PI / 2;
+  group.add(planeXZ);
+
+  const planeYZ = new THREE.Mesh(
+    new THREE.PlaneGeometry(DEBUG_PLANE_SIZE, DEBUG_PLANE_SIZE),
+    planeMaterial(0x44ff44)
+  );
+  planeYZ.rotation.y = Math.PI / 2;
+  group.add(planeYZ);
+
+  debugView.localArrow = new THREE.ArrowHelper(
+    new THREE.Vector3(0, 0, 1),
+    new THREE.Vector3(),
+    DEBUG_ARROW_LEN,
+    0xffd400
+  );
+  group.add(debugView.localArrow);
+
+  debugView.remoteArrow = new THREE.ArrowHelper(
+    new THREE.Vector3(0, 0, 1),
+    new THREE.Vector3(),
+    DEBUG_ARROW_LEN,
+    0xff00ff
+  );
+  group.add(debugView.remoteArrow);
+
+  debugView.remoteExpectedArrow = new THREE.ArrowHelper(
+    new THREE.Vector3(0, 0, 1),
+    new THREE.Vector3(),
+    DEBUG_ARROW_LEN,
+    0x00ffff
+  );
+  group.add(debugView.remoteExpectedArrow);
+
+  debugView.localAxes = new THREE.AxesHelper(0.6);
+  group.add(debugView.localAxes);
+
+  debugView.remoteAxes = new THREE.AxesHelper(0.6);
+  group.add(debugView.remoteAxes);
+
+  debugView.group = group;
+  scene.add(group);
+}
+
+function setDebugEnabled(next) {
+  debugEnabled = next;
+  if (debugEnabled) {
+    if (!debugView.group) {
+      setupDebugView();
+    }
+    if (debugView.group) {
+      debugView.group.visible = true;
+    }
+    if (debugView.overlay) {
+      debugView.overlay.style.display = 'block';
+    }
+    updateDebugView();
+  } else {
+    if (debugView.group) {
+      debugView.group.visible = false;
+    }
+    if (debugView.overlay) {
+      debugView.overlay.style.display = 'none';
+    }
+  }
+}
+
+function toggleDebugView() {
+  setDebugEnabled(!debugEnabled);
+}
+
+function formatVec3(vec, digits = 3) {
+  return `${vec.x.toFixed(digits)}, ${vec.y.toFixed(digits)}, ${vec.z.toFixed(digits)}`;
+}
+
+function formatQuat(quat, digits = 3) {
+  return `${quat.x.toFixed(digits)}, ${quat.y.toFixed(digits)}, ${quat.z.toFixed(digits)}, ${quat.w.toFixed(digits)}`;
+}
+
+function findDebugPeerId() {
+  if (selectedPeerId && remoteAvatars.has(selectedPeerId)) {
+    return selectedPeerId;
+  }
+  for (const peerId of remoteAvatars.keys()) {
+    return peerId;
+  }
+  return null;
+}
+
+function updateDebugView() {
+  if (!debugEnabled || !debugView.overlay) {
+    return;
+  }
+
+  const pos = controls.getObject().position;
+  debugLocalState.rawYaw = controls.getObject().rotation.y;
+  debugLocalState.rawPitch = camera.rotation.x;
+
+  camera.getWorldQuaternion(debugCameraQuat);
+  camera.getWorldDirection(debugCameraForward);
+  yawPitchFromCameraForward(debugCameraForward, cameraYawPitch);
+  debugLocalState.yaw = cameraYawPitch.yaw;
+  debugLocalState.pitch = cameraYawPitch.pitch;
+  debugLocalState.yawNorm = normalizeAngleRad(debugLocalState.yaw);
+  debugLocalState.pitchClamp = clampPitchRad(debugLocalState.pitch);
+
+  cameraForwardFromYawPitch(
+    debugLocalState.yawNorm,
+    debugLocalState.pitchClamp,
+    debugLocalExpected
+  );
+
+  debugView.localArrow.position.copy(pos);
+  debugView.localArrow.setDirection(debugCameraForward);
+  debugView.localAxes.position.copy(pos);
+
+  const peerId = findDebugPeerId();
+  const remoteState = peerId ? debugRemoteState.get(peerId) : null;
+  let remoteDot = null;
+  let remoteAngle = null;
+
+  if (peerId && remoteState) {
+    const avatar = remoteAvatars.get(peerId);
+    if (avatar) {
+      debugAvatarForwardVec.set(0, 0, 1).applyQuaternion(avatar.group.quaternion).normalize();
+      cameraForwardFromYawPitch(remoteState.yaw, remoteState.pitch, debugRemoteExpected);
+      debugExpectedForwardVec.set(
+        debugRemoteExpected.x,
+        debugRemoteExpected.y,
+        debugRemoteExpected.z
+      ).normalize();
+
+      remoteDot = debugAvatarForwardVec.dot(debugExpectedForwardVec);
+      remoteAngle = Math.acos(Math.max(-1, Math.min(1, remoteDot))) * (180 / Math.PI);
+
+      debugView.remoteArrow.visible = true;
+      debugView.remoteExpectedArrow.visible = true;
+      debugView.remoteAxes.visible = true;
+
+      debugView.remoteArrow.position.copy(avatar.group.position);
+      debugView.remoteArrow.setDirection(debugAvatarForwardVec);
+      debugView.remoteAxes.position.copy(avatar.group.position);
+
+      debugView.remoteExpectedArrow.position
+        .copy(avatar.group.position)
+        .addScaledVector(debugExpectedForwardVec, DEBUG_ARROW_OFFSET);
+      debugView.remoteExpectedArrow.setDirection(debugExpectedForwardVec);
+    }
+  } else {
+    debugView.remoteArrow.visible = false;
+    debugView.remoteExpectedArrow.visible = false;
+    debugView.remoteAxes.visible = false;
+  }
+
+  const rawYawDeg = THREE.MathUtils.radToDeg(debugLocalState.rawYaw);
+  const rawPitchDeg = THREE.MathUtils.radToDeg(debugLocalState.rawPitch);
+  const yawDeg = THREE.MathUtils.radToDeg(debugLocalState.yawNorm);
+  const pitchDeg = THREE.MathUtils.radToDeg(debugLocalState.pitchClamp);
+  const cameraForward = formatVec3(debugCameraForward);
+  const expectedLocalForward = `${debugLocalExpected.x.toFixed(3)}, ${debugLocalExpected.y.toFixed(3)}, ${debugLocalExpected.z.toFixed(3)}`;
+
+  const lines = [
+    'DEBUG VIEW',
+    `local pos: ${formatVec3(pos)}`,
+    `raw yaw: ${debugLocalState.rawYaw.toFixed(3)} rad (${rawYawDeg.toFixed(1)} deg)`,
+    `raw pitch: ${debugLocalState.rawPitch.toFixed(3)} rad (${rawPitchDeg.toFixed(1)} deg)`,
+    `derived yaw: ${debugLocalState.yawNorm.toFixed(3)} rad (${yawDeg.toFixed(1)} deg)`,
+    `derived pitch: ${debugLocalState.pitchClamp.toFixed(3)} rad (${pitchDeg.toFixed(1)} deg)`,
+    `camera quat: ${formatQuat(debugCameraQuat)}`,
+    `camera forward: ${cameraForward}`,
+    `expected forward: ${expectedLocalForward}`
+  ];
+
+  if (peerId && remoteState) {
+    lines.push('');
+    lines.push(`remote peer: ${peerId.slice(0, 6)}`);
+    lines.push(`remote pos: ${formatVec3(remoteState.position)}`);
+    lines.push(
+      `remote yaw/pitch: ${remoteState.yaw.toFixed(3)}, ${remoteState.pitch.toFixed(3)}`
+    );
+    lines.push(`remote quat: ${formatQuat(remoteState.quaternion)}`);
+    forwardFromQuat(remoteState.quaternion, debugRemoteActual);
+    lines.push(
+      `remote fwd: ${debugRemoteActual.x.toFixed(3)}, ${debugRemoteActual.y.toFixed(3)}, ${debugRemoteActual.z.toFixed(3)}`
+    );
+    lines.push(
+      `expect fwd: ${debugRemoteExpected.x.toFixed(3)}, ${debugRemoteExpected.y.toFixed(3)}, ${debugRemoteExpected.z.toFixed(3)}`
+    );
+    if (remoteDot !== null) {
+      lines.push(`fwd dot: ${remoteDot.toFixed(3)} angle: ${remoteAngle.toFixed(1)} deg`);
+    }
+  } else {
+    lines.push('');
+    lines.push('remote peer: none');
+  }
+
+  debugView.overlay.textContent = lines.join('\n');
+}
+
+function storeDebugRemoteState(peerId, avatar, yaw, pitch) {
+  if (!debugEnabled) {
+    return;
+  }
+  const q = avatar.group.quaternion;
+  debugRemoteState.set(peerId, {
+    yaw,
+    pitch,
+    position: {
+      x: avatar.group.position.x,
+      y: avatar.group.position.y,
+      z: avatar.group.position.z
+    },
+    quaternion: { x: q.x, y: q.y, z: q.z, w: q.w }
+  });
+}
+
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
+}
+
+function easeInOutSine(t) {
+  return 0.5 - 0.5 * Math.cos(Math.PI * t);
+}
+
+function startCrouchTransition(targetHeight) {
+  if (crouchTargetHeight === targetHeight && !crouchTransitionActive) {
+    currentBaseHeight = targetHeight;
+    return;
+  }
+
+  const now = performance.now();
+  if (crouchTransitionActive) {
+    const elapsed = (now - crouchStartTime) / 1000;
+    const t = clamp01(elapsed / CROUCH_DURATION);
+    const eased = easeInOutSine(t);
+    currentBaseHeight = THREE.MathUtils.lerp(
+      crouchFromHeight,
+      crouchTargetHeight,
+      eased
+    );
+  }
+
+  crouchFromHeight = currentBaseHeight;
+  crouchTargetHeight = targetHeight;
+  crouchStartTime = now;
+  crouchTransitionActive = true;
+}
+
+function updateCrouchHeight() {
+  if (!crouchTransitionActive) {
+    currentBaseHeight = crouchTargetHeight;
+    return currentBaseHeight;
+  }
+
+  const elapsed = (performance.now() - crouchStartTime) / 1000;
+  const t = clamp01(elapsed / CROUCH_DURATION);
+  const eased = easeInOutSine(t);
+  currentBaseHeight = THREE.MathUtils.lerp(
+    crouchFromHeight,
+    crouchTargetHeight,
+    eased
+  );
+
+  if (t >= 1) {
+    crouchTransitionActive = false;
+  }
+
+  return currentBaseHeight;
+}
+
+function applyJumpTick() {
+  jumpOffset += jumpVelocity;
+  jumpVelocity = (jumpVelocity - JUMP_GRAVITY) * JUMP_DRAG;
+}
+
+function startJump() {
+  moveState.jumping = true;
+  jumpVelocity = JUMP_VELOCITY;
+  jumpOffset = 0;
+  jumpAccumulator = 0;
+  applyJumpTick();
+}
+
+function updateJumpOffset(delta) {
+  if (!moveState.jumping) {
+    jumpOffset = 0;
+    jumpVelocity = 0;
+    jumpAccumulator = 0;
+    return 0;
+  }
+
+  jumpAccumulator += delta;
+  while (jumpAccumulator >= JUMP_TICK) {
+    applyJumpTick();
+    jumpAccumulator -= JUMP_TICK;
+
+    if (jumpOffset <= 0 && jumpVelocity < 0) {
+      moveState.jumping = false;
+      jumpOffset = 0;
+      jumpVelocity = 0;
+      jumpAccumulator = 0;
+      break;
+    }
+  }
+
+  return jumpOffset * JUMP_SCALE;
+}
 
 function setupLobby() {
   const params = new URLSearchParams(window.location.search);
@@ -584,6 +1007,9 @@ function initScene() {
   createGrassland();
   createOfficeInterior();
   createOutdoorAccents();
+  if (DEBUG_VIEW_DEFAULT) {
+    setDebugEnabled(true);
+  }
 
   renderer.domElement.addEventListener('click', () => {
     if (joined && !moveShareMode) {
@@ -1107,6 +1533,7 @@ function cleanupPeer(peerId) {
     poseChannels.delete(peerId);
   }
   poseInterpolators.delete(peerId);
+  debugRemoteState.delete(peerId);
   if (selectedPeerId === peerId) {
     hideVolumePopup();
   }
@@ -1395,6 +1822,7 @@ function handlePoseMessage(peerId, data) {
   }
 
   if (msg.type === 0) {
+    console.log('[POSE RX] from:', peerId.slice(0, 6), 'yaw:', msg.yaw?.toFixed(3), 'pitch:', msg.pitch?.toFixed(3));
     let interp = poseInterpolators.get(peerId);
     if (!interp) {
       interp = { poses: [], maxPoses: 5 };
@@ -1416,6 +1844,22 @@ function updateInterpolatedAvatars() {
   const now = performance.now();
   const bufferMs = 100;
 
+  function setAvatarRotationFromPose(avatar, yaw, pitch) {
+    avatarQuatFacingCamera(
+      yaw || 0,
+      pitch || 0,
+      avatarQuatOut,
+      avatarYawQuat,
+      avatarPitchQuat
+    );
+    avatar.group.quaternion.set(
+      avatarQuatOut.x,
+      avatarQuatOut.y,
+      avatarQuatOut.z,
+      avatarQuatOut.w
+    );
+  }
+
   remoteAvatars.forEach((avatar, peerId) => {
     const interp = poseInterpolators.get(peerId);
     if (!interp || interp.poses.length === 0) {
@@ -1425,7 +1869,8 @@ function updateInterpolatedAvatars() {
     if (interp.poses.length === 1) {
       const p = interp.poses[0].pose;
       avatar.group.position.set(p.x, p.y, p.z);
-      avatar.group.rotation.set(p.pitch || 0, (p.yaw || 0) + Math.PI, 0);
+      setAvatarRotationFromPose(avatar, p.yaw, p.pitch);
+      storeDebugRemoteState(peerId, avatar, p.yaw || 0, p.pitch || 0);
       updatePeerAudioPosition(peerId, avatar.group.position);
       return;
     }
@@ -1448,11 +1893,12 @@ function updateInterpolatedAvatars() {
     const x = p0.pose.x + (p1.pose.x - p0.pose.x) * t;
     const y = p0.pose.y + (p1.pose.y - p0.pose.y) * t;
     const z = p0.pose.z + (p1.pose.z - p0.pose.z) * t;
-    const yaw = p0.pose.yaw + (p1.pose.yaw - p0.pose.yaw) * t;
+    const yaw = lerpAngle(p0.pose.yaw, p1.pose.yaw, t);
     const pitch = p0.pose.pitch + (p1.pose.pitch - p0.pose.pitch) * t;
 
     avatar.group.position.set(x, y, z);
-    avatar.group.rotation.set(pitch, yaw + Math.PI, 0);
+    setAvatarRotationFromPose(avatar, yaw, pitch);
+    storeDebugRemoteState(peerId, avatar, yaw, pitch);
     updatePeerAudioPosition(peerId, avatar.group.position);
   });
 }
@@ -1693,8 +2139,10 @@ function maybeSendPose() {
   }
 
   const pos = controls.getObject().position;
-  const yaw = controls.getObject().rotation.y;
-  const pitch = camera.rotation.x;
+  camera.getWorldDirection(cameraForward);
+  yawPitchFromCameraForward(cameraForward, cameraYawPitch);
+  const yaw = normalizeAngleRad(cameraYawPitch.yaw);
+  const pitch = clampPitchRad(cameraYawPitch.pitch);
 
   const moved = pos.distanceTo(lastPose.position) > 0.02;
   const rotated =
@@ -1709,6 +2157,10 @@ function maybeSendPose() {
   lastPose.yaw = yaw;
   lastPose.pitch = pitch;
   lastPoseSent = now;
+
+  // Log raw camera quaternion for debugging
+  const q = camera.getWorldQuaternion(new THREE.Quaternion());
+  console.log('[POSE TX] yaw:', yaw.toFixed(3), 'pitch:', pitch.toFixed(3), 'quat:', q.x.toFixed(3), q.y.toFixed(3), q.z.toFixed(3), q.w.toFixed(3));
 
   const poseMsg = PoseMessage.create({
     type: 0,
@@ -1731,6 +2183,7 @@ function maybeSendPose() {
 function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta();
+  const jumpOffset = updateJumpOffset(delta);
 
   if (controls.isLocked) {
     velocity.x -= velocity.x * 10.0 * delta;
@@ -1752,18 +2205,8 @@ function animate() {
 
     controls.moveRight(-velocity.x * delta);
     controls.moveForward(-velocity.z * delta);
-    let targetHeight = moveState.crouch ? CROUCH_HEIGHT : STANDING_HEIGHT;
-
-    if (moveState.jumping) {
-      const jumpElapsed = (performance.now() - jumpStartTime) / 1000;
-      if (jumpElapsed < JUMP_DURATION) {
-        const jumpProgress = jumpElapsed / JUMP_DURATION;
-        const jumpOffset = JUMP_HEIGHT * Math.sin(jumpProgress * Math.PI);
-        targetHeight += jumpOffset;
-      } else {
-        moveState.jumping = false;
-      }
-    }
+    let targetHeight = updateCrouchHeight();
+    targetHeight += jumpOffset;
 
     currentHeight = targetHeight;
     controls.getObject().position.y = currentHeight;
@@ -1774,6 +2217,7 @@ function animate() {
   updateShareFacing();
   updateSpeakingIndicators();
   updateVolumePopupPosition();
+  updateDebugView();
   maybeSendPose();
   renderer.render(scene, camera);
 }
@@ -1785,6 +2229,15 @@ function onWindowResize() {
 }
 
 function onKeyDown(event) {
+  if (event.code === 'F3') {
+    if (event.repeat) {
+      return;
+    }
+    toggleDebugView();
+    event.preventDefault();
+    return;
+  }
+
   switch (event.code) {
     case 'KeyW':
     case 'ArrowUp':
@@ -1804,12 +2257,14 @@ function onKeyDown(event) {
       break;
     case 'ShiftLeft':
     case 'ShiftRight':
-      moveState.crouch = true;
+      if (!moveState.crouch) {
+        moveState.crouch = true;
+        startCrouchTransition(CROUCH_HEIGHT);
+      }
       break;
     case 'Space':
       if (!moveState.jumping) {
-        moveState.jumping = true;
-        jumpStartTime = performance.now();
+        startJump();
       }
       break;
     default:
@@ -1837,7 +2292,10 @@ function onKeyUp(event) {
       break;
     case 'ShiftLeft':
     case 'ShiftRight':
-      moveState.crouch = false;
+      if (moveState.crouch) {
+        moveState.crouch = false;
+        startCrouchTransition(STANDING_HEIGHT);
+      }
       break;
     default:
       break;

@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "proto": "pbjs -t static-module -w es6 -o public/proto/pose.js public/proto/pose.proto"
+    "proto": "pbjs -t static-module -w es6 -o public/proto/pose.js public/proto/pose.proto",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -15,6 +16,6 @@
   },
   "devDependencies": {
     "protobufjs-cli": "^1.1.2",
-    "wrangler": "^3.90.0"
+    "wrangler": "^4.57.0"
   }
 }
