@@ -371,10 +371,12 @@ label {
 
 #moveStick {
   left: max(var(--stick-offset), env(safe-area-inset-left));
+  right: auto;
   bottom: max(var(--stick-offset), env(safe-area-inset-bottom));
 }
 
 #lookStick {
+  left: auto;
   right: max(var(--stick-offset), env(safe-area-inset-right));
   bottom: max(var(--stick-offset), env(safe-area-inset-bottom));
 }
