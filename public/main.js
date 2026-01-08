@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { PoseMessage } from './proto/pose.js';
+import { createFaceZoomProcessor } from './face_zoom.mjs';
 import {
   avatarQuatFacingCamera,
   cameraForwardFromYawPitch,
@@ -13,11 +14,14 @@ import {
 const overlay = document.getElementById('overlay');
 const joinBtn = document.getElementById('joinBtn');
 const roomInput = document.getElementById('roomInput');
+const nameInput = document.getElementById('nameInput');
+const nameHudInput = document.getElementById('nameHudInput');
 const statusEl = document.getElementById('status');
 const controlsHint = document.getElementById('controlsHint');
 const localVideo = document.getElementById('localVideo');
 const shareBtn = document.getElementById('shareBtn');
 const moveShareBtn = document.getElementById('moveShareBtn');
+const faceZoomBtn = document.getElementById('faceZoomBtn');
 const shareLinkInput = document.getElementById('shareLink');
 const copyLinkBtn = document.getElementById('copyLinkBtn');
 const copyCodeBtn = document.getElementById('copyCodeBtn');
@@ -43,6 +47,11 @@ const DEBUG_PLANE_SIZE = 24;
 const DEBUG_GRID_DIVS = 24;
 const DEBUG_ARROW_LEN = 1.6;
 const DEBUG_ARROW_OFFSET = 0.25;
+const NAME_MAX_LENGTH = 24;
+const NAME_STORAGE_KEY = 'webrtsee-name';
+const NAME_TAG_WIDTH = 0.8;
+const NAME_TAG_HEIGHT = 0.16;
+const NAME_TAG_OFFSET_Y = 0.6;
 
 function lerpAngle(a, b, t) {
   let delta = b - a;
@@ -66,6 +75,10 @@ let joined = false;
 let hasJoinedRoom = false;
 let pendingShareStart = false;
 let isMuted = false;
+let localDisplayName = '';
+let pendingNameTimer = null;
+let faceZoom = null;
+let faceZoomEnabled = false;
 
 const peerConnections = new Map();
 const poseChannels = new Map();
@@ -78,6 +91,7 @@ const remoteShareMeta = new Map();
 const remoteTrackStreams = new Map();
 const remoteAvatarTrackIds = new Map();
 const remoteAudioNodes = new Map();
+const peerNames = new Map();
 
 let audioContext = null;
 let masterGain = null;
@@ -141,6 +155,7 @@ const debugCameraQuat = new THREE.Quaternion();
 const debugCameraForward = new THREE.Vector3();
 const debugAvatarForwardVec = new THREE.Vector3();
 const debugExpectedForwardVec = new THREE.Vector3();
+const nameTagWorldPos = new THREE.Vector3();
 const debugLocalExpected = { x: 0, y: 0, z: 0 };
 const debugRemoteExpected = { x: 0, y: 0, z: 0 };
 const debugRemoteActual = { x: 0, y: 0, z: 0 };
@@ -171,6 +186,7 @@ const lastPose = {
 let lastPoseSent = 0;
 
 setupLobby();
+setupDisplayName();
 initScene();
 animate();
 
@@ -179,6 +195,21 @@ joinBtn.addEventListener('click', () => {
     return;
   }
   joinExperience();
+});
+
+[nameInput, nameHudInput].forEach((input) => {
+  if (!input) {
+    return;
+  }
+  input.addEventListener('input', (event) => {
+    setLocalDisplayName(event.target.value);
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      input.blur();
+    }
+  });
 });
 
 roomInput.addEventListener('input', () => {
@@ -255,6 +286,13 @@ moveShareBtn.addEventListener('click', () => {
     return;
   }
   toggleMoveShare();
+});
+
+faceZoomBtn.addEventListener('click', () => {
+  if (!faceZoom) {
+    return;
+  }
+  setFaceZoomEnabled(!faceZoomEnabled);
 });
 
 function setupDebugView() {
@@ -616,6 +654,107 @@ function updateJumpOffset(delta) {
   return jumpOffset * JUMP_SCALE;
 }
 
+function setupDisplayName() {
+  const savedName = loadStoredName();
+  setLocalDisplayName(savedName || '', { sendUpdate: false });
+}
+
+function loadStoredName() {
+  try {
+    return localStorage.getItem(NAME_STORAGE_KEY) || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+function sanitizeDisplayName(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const trimmed = value.trim();
+  return trimmed.slice(0, NAME_MAX_LENGTH);
+}
+
+function syncNameInputValue(input, value) {
+  if (!input) {
+    return;
+  }
+  if (input.value !== value) {
+    input.value = value;
+  }
+}
+
+function setLocalDisplayName(value, options = {}) {
+  const { sendUpdate = true, syncInputs = true } = options;
+  const sanitized = sanitizeDisplayName(value);
+  localDisplayName = sanitized;
+  if (syncInputs) {
+    syncNameInputValue(nameInput, sanitized);
+    syncNameInputValue(nameHudInput, sanitized);
+  }
+  try {
+    if (sanitized) {
+      localStorage.setItem(NAME_STORAGE_KEY, sanitized);
+    } else {
+      localStorage.removeItem(NAME_STORAGE_KEY);
+    }
+  } catch (err) {
+    // Ignore storage errors.
+  }
+  if (sendUpdate) {
+    scheduleNameUpdate();
+  }
+}
+
+function scheduleNameUpdate() {
+  if (!socket || socket.readyState !== WebSocket.OPEN || !hasJoinedRoom) {
+    return;
+  }
+  if (pendingNameTimer) {
+    window.clearTimeout(pendingNameTimer);
+  }
+  pendingNameTimer = window.setTimeout(() => {
+    pendingNameTimer = null;
+    sendNameUpdate();
+  }, 300);
+}
+
+function sendNameUpdate() {
+  if (!socket || socket.readyState !== WebSocket.OPEN || !hasJoinedRoom) {
+    return;
+  }
+  socket.send(
+    JSON.stringify({
+      type: 'name-update',
+      name: localDisplayName
+    })
+  );
+}
+
+function setPeerName(peerId, name) {
+  if (!peerId) {
+    return;
+  }
+  const sanitized = sanitizeDisplayName(name);
+  if (sanitized) {
+    peerNames.set(peerId, sanitized);
+  } else {
+    peerNames.delete(peerId);
+  }
+  const avatar = remoteAvatars.get(peerId);
+  if (avatar) {
+    updateAvatarNameTag(avatar, sanitized);
+  }
+  if (selectedPeerId === peerId) {
+    updatePopupPeerName(peerId);
+  }
+}
+
+function updatePopupPeerName(peerId) {
+  const name = peerNames.get(peerId);
+  popupPeerName.textContent = name || `Peer ${peerId.slice(0, 6)}`;
+}
+
 function setupLobby() {
   const params = new URLSearchParams(window.location.search);
   const initialRoom = sanitizeRoomCode(params.get('room') || '');
@@ -891,6 +1030,29 @@ function updateMuteButton() {
   muteBtn.classList.toggle('muted', isMuted);
 }
 
+function setFaceZoomEnabled(enabled) {
+  faceZoomEnabled = Boolean(enabled);
+  if (faceZoom) {
+    faceZoom.setEnabled(faceZoomEnabled);
+  }
+  updateFaceZoomButton();
+}
+
+function updateFaceZoomButton() {
+  if (!faceZoomBtn) {
+    return;
+  }
+  if (!faceZoom) {
+    faceZoomBtn.disabled = true;
+    faceZoomBtn.classList.remove('active');
+    faceZoomBtn.textContent = 'Face Zoom';
+    return;
+  }
+  faceZoomBtn.disabled = false;
+  faceZoomBtn.textContent = faceZoomEnabled ? 'Face Zoom On' : 'Face Zoom Off';
+  faceZoomBtn.classList.toggle('active', faceZoomEnabled);
+}
+
 function setPeerVolume(peerId, value) {
   const node = remoteAudioNodes.get(peerId);
   if (!node) {
@@ -942,7 +1104,7 @@ function openVolumePopup(peerId) {
     return;
   }
   selectedPeerId = peerId;
-  popupPeerName.textContent = `Peer ${peerId.slice(0, 6)}`;
+  updatePopupPeerName(peerId);
   peerVolume.value = node.gain.gain.value.toFixed(2);
   mutePeerBtn.textContent = node.muted ? 'Unmute' : 'Mute';
   volumePopup.classList.remove('hidden');
@@ -1041,6 +1203,9 @@ function initScene() {
 }
 
 async function joinExperience() {
+  setLocalDisplayName(nameInput?.value || nameHudInput?.value || '', {
+    sendUpdate: false
+  });
   joinBtn.disabled = true;
   statusEl.textContent = 'Requesting camera + mic...';
   initAudioContext();
@@ -1065,8 +1230,21 @@ async function joinExperience() {
     return;
   }
 
-  localStream = new MediaStream(localMediaStream.getVideoTracks());
-  localVideo.srcObject = localMediaStream;
+  faceZoom = createFaceZoomProcessor(localMediaStream, {
+    detectIntervalMs: 80,
+    padding: 0.4,
+    smoothing: 0.2,
+    targetFps: 30
+  });
+  if (faceZoom && faceZoom.stream) {
+    faceZoom.setEnabled(faceZoomEnabled);
+    localStream = faceZoom.stream;
+    localVideo.srcObject = faceZoom.stream;
+  } else {
+    faceZoom = null;
+    localStream = new MediaStream(localMediaStream.getVideoTracks());
+    localVideo.srcObject = localMediaStream;
+  }
   playVideoElement(localVideo);
   createLocalAudioStream(localMediaStream);
   overlay.classList.add('hidden');
@@ -1074,6 +1252,7 @@ async function joinExperience() {
   shareBtn.disabled = false;
   muteBtn.disabled = false;
   masterVolume.disabled = false;
+  updateFaceZoomButton();
   connectSocket();
 }
 
@@ -1087,7 +1266,7 @@ function connectSocket() {
 
   socket.addEventListener('open', () => {
     statusEl.textContent = `Connected to ${room}`;
-    socket.send(JSON.stringify({ type: 'join', room }));
+    socket.send(JSON.stringify({ type: 'join', room, name: localDisplayName }));
     hasJoinedRoom = true;
     if (screenStream && pendingShareStart) {
       sendShareStart();
@@ -1109,11 +1288,16 @@ function connectSocket() {
     }
 
     if (msg.type === 'peers') {
+      const names =
+        msg.names && typeof msg.names === 'object' ? msg.names : null;
       msg.peers.forEach((peerId) => {
         if (peerId === myId) {
           return;
         }
         ensureRemoteAvatar(peerId);
+        if (names && names[peerId]) {
+          setPeerName(peerId, names[peerId]);
+        }
         createOffer(peerId);
       });
       if (Array.isArray(msg.shares)) {
@@ -1130,6 +1314,9 @@ function connectSocket() {
       if (msg.id && msg.id !== myId) {
         const peerId = msg.id;
         ensureRemoteAvatar(peerId);
+        if (msg.name) {
+          setPeerName(peerId, msg.name);
+        }
         if (localSharePanel && screenStream) {
           const pos = localSharePanel.group.position;
           const poseMsg = PoseMessage.create({
@@ -1159,6 +1346,13 @@ function connectSocket() {
 
     if (msg.type === 'peer-left') {
       cleanupPeer(msg.id);
+      return;
+    }
+
+    if (msg.type === 'name-update') {
+      if (msg.id && msg.id !== myId) {
+        setPeerName(msg.id, msg.name || '');
+      }
       return;
     }
 
@@ -1389,6 +1583,98 @@ function createVideoTexture(video) {
   return texture;
 }
 
+function createNameTag() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  if (texture.colorSpace !== undefined) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false
+  });
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(NAME_TAG_WIDTH, NAME_TAG_HEIGHT),
+    material
+  );
+  mesh.position.set(0, NAME_TAG_OFFSET_Y, 0);
+  mesh.renderOrder = 999;
+  mesh.visible = false;
+  return { canvas, ctx, texture, material, mesh };
+}
+
+function drawNameTag(tag, name) {
+  if (!tag || !tag.ctx) {
+    return;
+  }
+  const { canvas, ctx, texture, mesh } = tag;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!name) {
+    mesh.visible = false;
+    texture.needsUpdate = true;
+    return;
+  }
+
+  mesh.visible = true;
+
+  let fontSize = 56;
+  ctx.font = `bold ${fontSize}px "Minecraft", "Press Start 2P", monospace, sans-serif`;
+  let textWidth = ctx.measureText(name).width;
+  while (textWidth > canvas.width - 40 && fontSize > 24) {
+    fontSize -= 2;
+    ctx.font = `bold ${fontSize}px "Minecraft", "Press Start 2P", monospace, sans-serif`;
+    textWidth = ctx.measureText(name).width;
+  }
+
+  const padding = 16;
+  const bgWidth = textWidth + padding * 2;
+  const bgHeight = fontSize + padding;
+  const bgX = (canvas.width - bgWidth) / 2;
+  const bgY = (canvas.height - bgHeight) / 2;
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  ctx.fillRect(bgX, bgY, bgWidth, bgHeight);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+  ctx.shadowOffsetX = 2;
+  ctx.shadowOffsetY = 2;
+  ctx.shadowBlur = 0;
+  ctx.fillText(name, canvas.width / 2, canvas.height / 2);
+  ctx.shadowColor = 'transparent';
+
+  texture.needsUpdate = true;
+}
+
+function updateAvatarNameTag(avatar, name) {
+  if (!avatar) {
+    return;
+  }
+  if (!avatar.nameTag) {
+    avatar.nameTag = createNameTag();
+    avatar.group.add(avatar.nameTag.mesh);
+  }
+  drawNameTag(avatar.nameTag, name);
+}
+
+function updateNameTagBillboards() {
+  remoteAvatars.forEach((avatar) => {
+    if (avatar.nameTag && avatar.nameTag.mesh.visible) {
+      const mesh = avatar.nameTag.mesh;
+      mesh.getWorldPosition(nameTagWorldPos);
+      mesh.lookAt(camera.position);
+    }
+  });
+}
+
 function attachRemoteTrack(peerId, trackId, stream) {
   const shareMeta = remoteShareMeta.get(peerId);
   if (shareMeta && shareMeta.trackId === trackId) {
@@ -1469,12 +1755,17 @@ function ensureRemoteAvatar(peerId) {
     texture: null,
     boardMaterial: boardMat,
     meter,
-    hitbox: board
+    hitbox: board,
+    nameTag: null
   };
 
   board.userData.peerId = peerId;
 
   remoteAvatars.set(peerId, avatar);
+  const knownName = peerNames.get(peerId);
+  if (knownName) {
+    updateAvatarNameTag(avatar, knownName);
+  }
   return avatar;
 }
 
@@ -1496,6 +1787,11 @@ function cleanupPeer(peerId) {
   if (avatar) {
     if (avatar.texture) {
       avatar.texture.dispose();
+    }
+    if (avatar.nameTag) {
+      avatar.nameTag.texture.dispose();
+      avatar.nameTag.material.dispose();
+      avatar.nameTag.mesh.geometry.dispose();
     }
     scene.remove(avatar.group);
     remoteAvatars.delete(peerId);
@@ -1527,6 +1823,7 @@ function cleanupPeer(peerId) {
   remoteShareMeta.delete(peerId);
   remoteTrackStreams.delete(peerId);
   remoteAvatarTrackIds.delete(peerId);
+  peerNames.delete(peerId);
   const channel = poseChannels.get(peerId);
   if (channel) {
     channel.close();
@@ -2214,6 +2511,7 @@ function animate() {
 
   updateAudioListenerPosition();
   updateInterpolatedAvatars();
+  updateNameTagBillboards();
   updateShareFacing();
   updateSpeakingIndicators();
   updateVolumePopupPosition();
