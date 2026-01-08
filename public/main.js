@@ -2821,6 +2821,8 @@ function onKeyDown(event) {
       break;
     case 'ShiftLeft':
     case 'ShiftRight':
+    case 'ControlLeft':
+    case 'ControlRight':
       if (!moveState.crouch) {
         moveState.crouch = true;
         startCrouchTransition(CROUCH_HEIGHT);
@@ -2856,6 +2858,8 @@ function onKeyUp(event) {
       break;
     case 'ShiftLeft':
     case 'ShiftRight':
+    case 'ControlLeft':
+    case 'ControlRight':
       if (moveState.crouch) {
         moveState.crouch = false;
         startCrouchTransition(STANDING_HEIGHT);
