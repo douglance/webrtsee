@@ -131,17 +131,24 @@ label {
 
 #copyLinkBtn,
 #copyCodeBtn {
-  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(18, 24, 30, 0.75);
   color: rgba(245, 242, 234, 0.9);
-  font-family: "DM Mono", monospace;
-  font-size: 0.7rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+#copyLinkBtn svg,
+#copyCodeBtn svg {
+  width: 18px;
+  height: 18px;
 }
 
 #copyLinkBtn:hover,
@@ -244,17 +251,23 @@ label {
 }
 
 #toolbar button {
-  padding: 8px 12px;
-  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 50%;
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(18, 24, 30, 0.75);
   color: rgba(245, 242, 234, 0.9);
-  font-family: "DM Mono", monospace;
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+#toolbar button svg {
+  width: 20px;
+  height: 20px;
 }
 
 #toolbar button:hover {
@@ -379,19 +392,23 @@ label {
 }
 
 #mobileControls .mobile-buttons button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: var(--button-size);
   height: var(--button-size);
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   background: rgba(18, 24, 30, 0.78);
   color: rgba(245, 242, 234, 0.9);
-  font-family: "DM Mono", monospace;
-  font-size: 0.7rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
   cursor: pointer;
   touch-action: none;
   -webkit-tap-highlight-color: transparent;
+}
+
+#mobileControls .mobile-buttons button svg {
+  width: 24px;
+  height: 24px;
 }
 
 #mobileControls .mobile-buttons button:active {
@@ -410,16 +427,22 @@ label {
 }
 
 #mutePeerBtn {
-  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(18, 24, 30, 0.75);
   color: rgba(245, 242, 234, 0.9);
-  font-family: "DM Mono", monospace;
-  font-size: 0.7rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
   cursor: pointer;
+}
+
+#mutePeerBtn svg {
+  width: 18px;
+  height: 18px;
 }
 
 #localIdentity {

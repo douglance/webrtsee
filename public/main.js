@@ -1081,8 +1081,13 @@ function updateMuteButton() {
   if (!muteBtn) {
     return;
   }
-  muteBtn.textContent = isMuted ? 'Unmute Mic' : 'Mute Mic';
+  muteBtn.innerHTML = isMuted
+    ? '<i data-lucide="mic-off"></i>'
+    : '<i data-lucide="mic"></i>';
   muteBtn.classList.toggle('muted', isMuted);
+  if (window.lucide) {
+    window.lucide.createIcons({ nodes: [muteBtn] });
+  }
 }
 
 function setFaceZoomEnabled(enabled) {
@@ -1100,12 +1105,20 @@ function updateFaceZoomButton() {
   if (!faceZoom) {
     faceZoomBtn.disabled = true;
     faceZoomBtn.classList.remove('active');
-    faceZoomBtn.textContent = 'Face Zoom';
+    faceZoomBtn.innerHTML = '<i data-lucide="scan-face"></i>';
+    if (window.lucide) {
+      window.lucide.createIcons({ nodes: [faceZoomBtn] });
+    }
     return;
   }
   faceZoomBtn.disabled = false;
-  faceZoomBtn.textContent = faceZoomEnabled ? 'Face Zoom On' : 'Face Zoom Off';
+  faceZoomBtn.innerHTML = faceZoomEnabled
+    ? '<i data-lucide="focus"></i>'
+    : '<i data-lucide="scan-face"></i>';
   faceZoomBtn.classList.toggle('active', faceZoomEnabled);
+  if (window.lucide) {
+    window.lucide.createIcons({ nodes: [faceZoomBtn] });
+  }
 }
 
 function setPeerVolume(peerId, value) {

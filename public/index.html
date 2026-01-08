@@ -11,6 +11,7 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/style.css" />
+    <script src="https://unpkg.com/lucide@latest"></script>
   </head>
   <body>
     <div id="overlay">
@@ -42,8 +43,8 @@
         </div>
         <div class="row secondary">
           <input id="shareLink" type="text" value="" readonly />
-          <button id="copyLinkBtn">Copy Link</button>
-          <button id="copyCodeBtn">Copy Code</button>
+          <button id="copyLinkBtn"><i data-lucide="link"></i></button>
+          <button id="copyCodeBtn"><i data-lucide="copy"></i></button>
         </div>
         <div class="tips">
           <span>WASD to move, mouse to look</span>
@@ -58,10 +59,10 @@
       <div id="status">Not connected</div>
       <div id="controlsHint">Click to look around</div>
       <div id="toolbar">
-        <button id="shareBtn" disabled>Share Screen</button>
-        <button id="moveShareBtn" disabled>Move Screen</button>
-        <button id="faceZoomBtn" disabled>Face Zoom Off</button>
-        <button id="muteBtn" disabled>Mute Mic</button>
+        <button id="shareBtn" disabled><i data-lucide="monitor"></i></button>
+        <button id="moveShareBtn" disabled><i data-lucide="move"></i></button>
+        <button id="faceZoomBtn" disabled><i data-lucide="scan-face"></i></button>
+        <button id="muteBtn" disabled><i data-lucide="mic"></i></button>
         <div class="slider">
           <label for="masterVolume">Volume</label>
           <input
@@ -92,15 +93,15 @@
       <div id="moveStick" class="joystick-zone"></div>
       <div id="lookStick" class="joystick-zone"></div>
       <div class="mobile-buttons">
-        <button id="jumpBtn" type="button">Jump</button>
-        <button id="crouchBtn" type="button">Crouch</button>
+        <button id="jumpBtn" type="button"><i data-lucide="arrow-up"></i></button>
+        <button id="crouchBtn" type="button"><i data-lucide="arrow-down"></i></button>
       </div>
     </div>
 
     <div id="volumePopup" class="hidden">
       <div id="popupPeerName">Peer</div>
       <input type="range" id="peerVolume" min="0" max="1" step="0.05" value="1" />
-      <button id="mutePeerBtn">Mute</button>
+      <button id="mutePeerBtn"><i data-lucide="volume-x"></i></button>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/nipplejs@0.10.1/dist/nipplejs.min.js"></script>
@@ -115,5 +116,10 @@
       }
     </script>
     <script type="module" src="/main.js"></script>
+    <script>
+      document.addEventListener('DOMContentLoaded', () => {
+        lucide.createIcons();
+      });
+    </script>
   </body>
 </html>
