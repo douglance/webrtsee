@@ -31,6 +31,11 @@ const volumePopup = document.getElementById('volumePopup');
 const popupPeerName = document.getElementById('popupPeerName');
 const peerVolume = document.getElementById('peerVolume');
 const mutePeerBtn = document.getElementById('mutePeerBtn');
+const mobileControlsEl = document.getElementById('mobileControls');
+const moveStick = document.getElementById('moveStick');
+const lookStick = document.getElementById('lookStick');
+const jumpBtn = document.getElementById('jumpBtn');
+const crouchBtn = document.getElementById('crouchBtn');
 
 const MAX_PIXEL_RATIO = 1;
 const ROOM_CODE_LENGTH = 6;
@@ -52,6 +57,10 @@ const NAME_STORAGE_KEY = 'webrtsee-name';
 const NAME_TAG_WIDTH = 0.8;
 const NAME_TAG_HEIGHT = 0.16;
 const NAME_TAG_OFFSET_Y = 0.6;
+const MOBILE_MOVE_DEADZONE = 0.16;
+const MOBILE_LOOK_DEADZONE = 0.12;
+const MOBILE_LOOK_SPEED = 2.2;
+const MOBILE_LOOK_SPEED_PITCH = 1.4;
 
 function lerpAngle(a, b, t) {
   let delta = b - a;
@@ -123,6 +132,19 @@ const moveState = {
   crouch: false,
   jumping: false
 };
+const mobileControls = {
+  supported: false,
+  active: false,
+  el: mobileControlsEl,
+  moveZone: moveStick,
+  lookZone: lookStick,
+  jumpBtn,
+  crouchBtn,
+  move: new THREE.Vector2(),
+  look: new THREE.Vector2(),
+  left: null,
+  right: null
+};
 const STANDING_HEIGHT = 1.6;
 const CROUCH_HEIGHT = 0.9;
 const CROUCH_DURATION = 0.35;
@@ -137,6 +159,10 @@ const JUMP_SCALE = JUMP_HEIGHT / MC_JUMP_PEAK;
 let jumpVelocity = 0;
 let jumpOffset = 0;
 let jumpAccumulator = 0;
+
+// Platform collision system
+const platforms = [];
+let currentPlatformHeight = 0;
 let crouchStartTime = 0;
 let currentBaseHeight = STANDING_HEIGHT;
 let crouchFromHeight = STANDING_HEIGHT;
@@ -150,6 +176,7 @@ const cameraYawPitch = { yaw: 0, pitch: 0 };
 const avatarQuatOut = { x: 0, y: 0, z: 0, w: 1 };
 const avatarYawQuat = { x: 0, y: 0, z: 0, w: 1 };
 const avatarPitchQuat = { x: 0, y: 0, z: 0, w: 1 };
+const mobileLookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 const debugRemoteState = new Map();
 const debugCameraQuat = new THREE.Quaternion();
 const debugCameraForward = new THREE.Vector3();
@@ -654,6 +681,34 @@ function updateJumpOffset(delta) {
   return jumpOffset * JUMP_SCALE;
 }
 
+function checkPlatformCollision(x, z, currentY) {
+  let highestPlatform = 0;
+  for (const platform of platforms) {
+    if (
+      x >= platform.minX &&
+      x <= platform.maxX &&
+      z >= platform.minZ &&
+      z <= platform.maxZ
+    ) {
+      if (currentY >= platform.y - 0.5 && platform.y > highestPlatform) {
+        highestPlatform = platform.y;
+      }
+    }
+  }
+  return highestPlatform;
+}
+
+function registerPlatform(mesh, offsetY = 0) {
+  const box = new THREE.Box3().setFromObject(mesh);
+  platforms.push({
+    minX: box.min.x,
+    maxX: box.max.x,
+    minZ: box.min.z,
+    maxZ: box.max.z,
+    y: box.max.y + offsetY
+  });
+}
+
 function setupDisplayName() {
   const savedName = loadStoredName();
   setLocalDisplayName(savedName || '', { sendUpdate: false });
@@ -1135,8 +1190,8 @@ function updateVolumePopupPosition() {
 
 function initScene() {
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x87c9ff);
-  scene.fog = new THREE.Fog(0x87c9ff, 25, 140);
+  scene.background = new THREE.Color(0x1a1a2e);
+  scene.fog = new THREE.Fog(0x1a1a2e, 40, 80);
 
   camera = new THREE.PerspectiveCamera(
     70,
@@ -1144,6 +1199,7 @@ function initScene() {
     0.1,
     260
   );
+  camera.rotation.order = 'YXZ';
 
   renderer = new THREE.WebGLRenderer({
     antialias: false,
@@ -1154,7 +1210,7 @@ function initScene() {
   document.body.appendChild(renderer.domElement);
 
   controls = new PointerLockControls(camera, renderer.domElement);
-  controls.getObject().position.set(0, STANDING_HEIGHT, 18);
+  controls.getObject().position.set(0, STANDING_HEIGHT, 12);
   scene.add(controls.getObject());
 
   clock = new THREE.Clock();
@@ -1168,13 +1224,15 @@ function initScene() {
 
   createGrassland();
   createOfficeInterior();
+  createJumpingPuzzles();
+  createSecrets();
   createOutdoorAccents();
   if (DEBUG_VIEW_DEFAULT) {
     setDebugEnabled(true);
   }
 
   renderer.domElement.addEventListener('click', () => {
-    if (joined && !moveShareMode) {
+    if (joined && !moveShareMode && !mobileControls.active) {
       controls.lock();
     }
   });
@@ -1184,17 +1242,15 @@ function initScene() {
   renderer.domElement.addEventListener('pointerup', onPointerUp);
   renderer.domElement.addEventListener('pointerleave', onPointerUp);
 
+  setupMobileControls();
+
   controls.addEventListener('lock', () => {
-    if (!moveShareMode) {
-      controlsHint.textContent = 'WASD to move - ESC to release';
-    }
+    updateControlsHint();
     hideVolumePopup();
   });
 
   controls.addEventListener('unlock', () => {
-    if (!moveShareMode) {
-      controlsHint.textContent = 'Click to look around';
-    }
+    updateControlsHint();
   });
 
   window.addEventListener('resize', onWindowResize);
@@ -1253,6 +1309,7 @@ async function joinExperience() {
   muteBtn.disabled = false;
   masterVolume.disabled = false;
   updateFaceZoomButton();
+  setMobileControlsActive(mobileControls.supported && !moveShareMode);
   connectSocket();
 }
 
@@ -1965,16 +2022,14 @@ function toggleMoveShare(forceState) {
     if (controls.isLocked) {
       controls.unlock();
     }
-    controlsHint.textContent = 'Drag the screen to move it';
     hideVolumePopup();
   } else {
-    controlsHint.textContent = controls.isLocked
-      ? 'WASD to move - ESC to release'
-      : 'Click to look around';
     if (wasLockedBeforeMove) {
       controls.lock();
     }
   }
+  setMobileControlsActive(joined && !moveShareMode && mobileControls.supported);
+  updateControlsHint();
 }
 
 function sendShareStart() {
@@ -2425,6 +2480,185 @@ function updatePointer(event) {
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 }
 
+function isTouchOnlyDevice() {
+  if (!window.matchMedia) {
+    return false;
+  }
+  return (
+    window.matchMedia('(pointer: coarse)').matches &&
+    window.matchMedia('(hover: none)').matches
+  );
+}
+
+function updateControlsHint() {
+  if (moveShareMode) {
+    controlsHint.textContent = 'Drag the screen to move it';
+    return;
+  }
+  if (mobileControls.active) {
+    controlsHint.textContent = 'Left stick to move - Right stick to look';
+    return;
+  }
+  controlsHint.textContent = controls.isLocked
+    ? 'WASD to move - ESC to release'
+    : 'Click to look around';
+}
+
+function setMobileControlsActive(active) {
+  if (!mobileControls.supported || !mobileControls.el) {
+    return;
+  }
+  const next = Boolean(active);
+  if (next === mobileControls.active) {
+    return;
+  }
+  mobileControls.active = next;
+  mobileControls.el.classList.toggle('active', next);
+  document.body.classList.toggle('mobile-active', next);
+  if (!next) {
+    mobileControls.move.set(0, 0);
+    mobileControls.look.set(0, 0);
+  }
+  updateControlsHint();
+}
+
+function applyJoystickVector(target, data, deadzone, invertY) {
+  if (!data || !data.vector) {
+    target.set(0, 0);
+    return;
+  }
+  let x = data.vector.x || 0;
+  let y = data.vector.y || 0;
+  if (invertY) {
+    y = -y;
+  }
+  const len = Math.hypot(x, y);
+  if (len < deadzone) {
+    target.set(0, 0);
+    return;
+  }
+  target.set(x, y);
+}
+
+function bindHoldButton(button, onDown, onUp) {
+  if (!button) {
+    return;
+  }
+  button.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.setPointerCapture) {
+      button.setPointerCapture(event.pointerId);
+    }
+    onDown();
+  });
+  if (!onUp) {
+    return;
+  }
+  const release = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (
+      button.releasePointerCapture &&
+      button.hasPointerCapture &&
+      button.hasPointerCapture(event.pointerId)
+    ) {
+      button.releasePointerCapture(event.pointerId);
+    }
+    onUp();
+  };
+  button.addEventListener('pointerup', release);
+  button.addEventListener('pointercancel', release);
+  button.addEventListener('pointerleave', release);
+}
+
+function setupMobileControls() {
+  if (!mobileControls.el || !mobileControls.moveZone || !mobileControls.lookZone) {
+    return;
+  }
+  if (!window.nipplejs || !isTouchOnlyDevice()) {
+    return;
+  }
+
+  mobileControls.supported = true;
+  const stickSize = mobileControls.moveZone.clientWidth || 120;
+
+  mobileControls.left = window.nipplejs.create({
+    zone: mobileControls.moveZone,
+    mode: 'static',
+    position: { left: '50%', top: '50%' },
+    color: '#f2b24d',
+    size: stickSize,
+    restOpacity: 0.4
+  });
+
+  mobileControls.left.on('move', (evt, data) => {
+    applyJoystickVector(mobileControls.move, data, MOBILE_MOVE_DEADZONE, false);
+  });
+  mobileControls.left.on('end', () => {
+    mobileControls.move.set(0, 0);
+  });
+
+  mobileControls.right = window.nipplejs.create({
+    zone: mobileControls.lookZone,
+    mode: 'static',
+    position: { left: '50%', top: '50%' },
+    color: '#2bb3a7',
+    size: stickSize,
+    restOpacity: 0.4
+  });
+
+  mobileControls.right.on('move', (evt, data) => {
+    applyJoystickVector(mobileControls.look, data, MOBILE_LOOK_DEADZONE, false);
+  });
+  mobileControls.right.on('end', () => {
+    mobileControls.look.set(0, 0);
+  });
+
+  bindHoldButton(mobileControls.jumpBtn, () => {
+    if (!joined || moveState.jumping) {
+      return;
+    }
+    startJump();
+  });
+
+  bindHoldButton(
+    mobileControls.crouchBtn,
+    () => {
+      if (!joined || moveState.crouch) {
+        return;
+      }
+      moveState.crouch = true;
+      startCrouchTransition(CROUCH_HEIGHT);
+    },
+    () => {
+      if (!joined || !moveState.crouch) {
+        return;
+      }
+      moveState.crouch = false;
+      startCrouchTransition(STANDING_HEIGHT);
+    }
+  );
+}
+
+function applyMobileLook(delta) {
+  if (!mobileControls.active || controls.isLocked) {
+    return;
+  }
+  if (
+    Math.abs(mobileControls.look.x) < 0.001 &&
+    Math.abs(mobileControls.look.y) < 0.001
+  ) {
+    return;
+  }
+  mobileLookEuler.setFromQuaternion(camera.quaternion);
+  mobileLookEuler.y -= mobileControls.look.x * MOBILE_LOOK_SPEED * delta;
+  mobileLookEuler.x += mobileControls.look.y * MOBILE_LOOK_SPEED_PITCH * delta;
+  mobileLookEuler.x = clampPitchRad(mobileLookEuler.x);
+  mobileLookEuler.z = 0;
+  camera.quaternion.setFromEuler(mobileLookEuler);
+}
+
 function maybeSendPose() {
   if (!joined) {
     return;
@@ -2480,30 +2714,62 @@ function maybeSendPose() {
 function animate() {
   requestAnimationFrame(animate);
   const delta = clock.getDelta();
-  const jumpOffset = updateJumpOffset(delta);
+  let jumpOffset = updateJumpOffset(delta);
+  applyMobileLook(delta);
 
-  if (controls.isLocked) {
+  const canMove = joined && (controls.isLocked || mobileControls.active);
+  if (canMove) {
     velocity.x -= velocity.x * 10.0 * delta;
     velocity.z -= velocity.z * 10.0 * delta;
 
-    direction.z = Number(moveState.forward) - Number(moveState.backward);
-    direction.x = Number(moveState.right) - Number(moveState.left);
-    direction.normalize();
+    let inputX = 0;
+    let inputZ = 0;
+    let inputScale = 1;
 
-    const speed = 18.0;
-
-    if (moveState.forward || moveState.backward) {
-      velocity.z -= direction.z * speed * delta;
+    if (mobileControls.active) {
+      inputX = mobileControls.move.x;
+      inputZ = mobileControls.move.y;
+      inputScale = Math.min(1, Math.hypot(inputX, inputZ));
+    } else {
+      inputX = Number(moveState.right) - Number(moveState.left);
+      inputZ = Number(moveState.forward) - Number(moveState.backward);
     }
 
-    if (moveState.left || moveState.right) {
+    direction.set(inputX, 0, inputZ);
+    const moving = direction.lengthSq() > 0.0001;
+
+    if (moving) {
+      direction.normalize();
+      const speed = 32.0 * inputScale;
+      velocity.z -= direction.z * speed * delta;
       velocity.x -= direction.x * speed * delta;
     }
 
     controls.moveRight(-velocity.x * delta);
     controls.moveForward(-velocity.z * delta);
+
+    const pos = controls.getObject().position;
+    const platformHeight = checkPlatformCollision(pos.x, pos.z, pos.y);
+
+    if (platformHeight > 0 && !moveState.jumping) {
+      currentPlatformHeight = platformHeight;
+    } else if (platformHeight === 0 && !moveState.jumping) {
+      currentPlatformHeight = 0;
+    }
+
     let targetHeight = updateCrouchHeight();
-    targetHeight += jumpOffset;
+    targetHeight += jumpOffset + currentPlatformHeight;
+
+    if (moveState.jumping && jumpVelocity < 0) {
+      const newPlatformCheck = checkPlatformCollision(pos.x, pos.z, pos.y);
+      if (newPlatformCheck > 0 && pos.y <= newPlatformCheck + STANDING_HEIGHT + 0.1) {
+        moveState.jumping = false;
+        jumpOffset = 0;
+        jumpVelocity = 0;
+        currentPlatformHeight = newPlatformCheck;
+        targetHeight = updateCrouchHeight() + currentPlatformHeight;
+      }
+    }
 
     currentHeight = targetHeight;
     controls.getObject().position.y = currentHeight;
@@ -2601,318 +2867,1483 @@ function onKeyUp(event) {
 }
 
 function createGrassland() {
-  const texture = new THREE.CanvasTexture(createGrassCanvas());
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  texture.repeat.set(48, 48);
-
-  const material = new THREE.MeshStandardMaterial({
-    map: texture,
-    roughness: 1
-  });
-
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(220, 220),
-    material
-  );
-  ground.rotation.x = -Math.PI / 2;
-  scene.add(ground);
-
-  const pathMaterial = new THREE.MeshStandardMaterial({
-    color: 0xb07c4b,
-    roughness: 0.9
-  });
-  const path = new THREE.Mesh(new THREE.PlaneGeometry(10, 60), pathMaterial);
-  path.rotation.x = -Math.PI / 2;
-  path.position.set(0, 0.01, 8);
-  scene.add(path);
+  // No outdoor grassland - we're fully enclosed in the SF office
 }
 
-function createGrassCanvas() {
-  const size = 256;
+function createSkylineBackdrop() {
   const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
+  canvas.width = 4096;
+  canvas.height = 2048;
   const ctx = canvas.getContext('2d');
 
-  ctx.fillStyle = '#2c7d32';
-  ctx.fillRect(0, 0, size, size);
+  // Gradient sky - SF golden hour with more color bands
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  skyGrad.addColorStop(0, '#0a0a1a');
+  skyGrad.addColorStop(0.15, '#1a1a3e');
+  skyGrad.addColorStop(0.3, '#2d1b4e');
+  skyGrad.addColorStop(0.45, '#6b2d5b');
+  skyGrad.addColorStop(0.55, '#d4456a');
+  skyGrad.addColorStop(0.65, '#ff6b4a');
+  skyGrad.addColorStop(0.75, '#ffaa33');
+  skyGrad.addColorStop(0.85, '#ffd066');
+  skyGrad.addColorStop(1, '#ffe599');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  for (let i = 0; i < 3000; i += 1) {
-    const x = Math.floor(Math.random() * size);
-    const y = Math.floor(Math.random() * size);
-    const shade = 80 + Math.floor(Math.random() * 80);
-    const height = Math.random() * 6 + 1;
-    ctx.fillStyle = `rgb(32, ${shade}, 44)`;
-    ctx.fillRect(x, y, 1, height);
+  // Atmospheric haze layers
+  for (let i = 0; i < 5; i++) {
+    const y = canvas.height * (0.5 + i * 0.08);
+    const hazeGrad = ctx.createLinearGradient(0, y - 40, 0, y + 40);
+    hazeGrad.addColorStop(0, 'rgba(255, 200, 150, 0)');
+    hazeGrad.addColorStop(0.5, `rgba(255, 180, 120, ${0.08 - i * 0.01})`);
+    hazeGrad.addColorStop(1, 'rgba(255, 200, 150, 0)');
+    ctx.fillStyle = hazeGrad;
+    ctx.fillRect(0, y - 40, canvas.width, 80);
   }
 
-  for (let i = 0; i < 200; i += 1) {
-    const x = Math.floor(Math.random() * size);
-    const y = Math.floor(Math.random() * size);
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+  // SF Bay water with gradient reflection
+  const waterGrad = ctx.createLinearGradient(0, canvas.height * 0.78, 0, canvas.height);
+  waterGrad.addColorStop(0, 'rgba(255, 180, 100, 0.4)');
+  waterGrad.addColorStop(0.3, 'rgba(40, 80, 120, 0.7)');
+  waterGrad.addColorStop(1, 'rgba(15, 30, 60, 0.9)');
+  ctx.fillStyle = waterGrad;
+  ctx.fillRect(0, canvas.height * 0.78, canvas.width, canvas.height * 0.22);
+
+  // Water shimmer
+  ctx.strokeStyle = 'rgba(255, 220, 150, 0.15)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 200; i++) {
+    const x = Math.random() * canvas.width;
+    const y = canvas.height * 0.78 + Math.random() * canvas.height * 0.22;
+    const len = 20 + Math.random() * 60;
     ctx.beginPath();
-    ctx.arc(x, y, Math.random() * 1.2 + 0.4, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + len, y);
+    ctx.stroke();
   }
+
+  // Distant mountains (Marin headlands) with depth
+  const mountainLayers = [
+    { offset: 0.62, color: '#1a1a2a', points: [0, 0.62, 300, 0.52, 600, 0.58, 900, 0.48, 1200, 0.55, 1500, 0.50, 1800, 0.56, 2100, 0.52, 2400, 0.58, 2700, 0.54, 3000, 0.60, 3300, 0.55, 3600, 0.58, 3900, 0.54, 4096, 0.60] },
+    { offset: 0.68, color: '#252535', points: [0, 0.68, 250, 0.60, 500, 0.65, 800, 0.58, 1100, 0.64, 1400, 0.59, 1700, 0.66, 2000, 0.61, 2300, 0.67, 2600, 0.62, 2900, 0.68, 3200, 0.63, 3500, 0.66, 3800, 0.61, 4096, 0.68] },
+  ];
+
+  mountainLayers.forEach((layer) => {
+    ctx.fillStyle = layer.color;
+    ctx.beginPath();
+    ctx.moveTo(0, canvas.height * layer.points[1]);
+    for (let i = 2; i < layer.points.length; i += 2) {
+      ctx.lineTo(layer.points[i], canvas.height * layer.points[i + 1]);
+    }
+    ctx.lineTo(canvas.width, canvas.height * 0.78);
+    ctx.lineTo(0, canvas.height * 0.78);
+    ctx.closePath();
+    ctx.fill();
+  });
+
+  // SF Downtown skyline - more buildings with varied styles
+  const buildingData = [
+    { x: 80, w: 70, h: 200, style: 'modern' },
+    { x: 170, w: 90, h: 320, style: 'glass' },
+    { x: 280, w: 60, h: 260, style: 'modern' },
+    { x: 360, w: 55, h: 240, style: 'art-deco' },
+    { x: 440, w: 120, h: 520, style: 'salesforce' },
+    { x: 580, w: 80, h: 380, style: 'glass' },
+    { x: 680, w: 100, h: 420, style: 'modern' },
+    { x: 800, w: 70, h: 340, style: 'glass' },
+    { x: 890, w: 90, h: 400, style: 'modern' },
+    { x: 1000, w: 50, h: 280, style: 'art-deco' },
+    { x: 1070, w: 110, h: 460, style: 'glass' },
+    { x: 1200, w: 80, h: 360, style: 'modern' },
+    { x: 1300, w: 95, h: 400, style: 'glass' },
+    { x: 1420, w: 70, h: 320, style: 'modern' },
+    { x: 1510, w: 85, h: 380, style: 'art-deco' },
+    { x: 1620, w: 100, h: 440, style: 'glass' },
+    { x: 1740, w: 75, h: 340, style: 'modern' },
+    { x: 1840, w: 90, h: 400, style: 'glass' },
+    { x: 1950, w: 65, h: 300, style: 'modern' },
+    { x: 2040, w: 110, h: 480, style: 'glass' },
+    { x: 2170, w: 80, h: 360, style: 'art-deco' },
+    { x: 2270, w: 95, h: 420, style: 'modern' },
+    { x: 2390, w: 70, h: 320, style: 'glass' },
+    { x: 2480, w: 100, h: 440, style: 'modern' },
+    { x: 2600, w: 85, h: 380, style: 'glass' },
+    { x: 2710, w: 75, h: 340, style: 'art-deco' },
+    { x: 2810, w: 110, h: 460, style: 'glass' },
+    { x: 2940, w: 80, h: 360, style: 'modern' },
+    { x: 3040, w: 95, h: 400, style: 'glass' },
+    { x: 3160, w: 70, h: 320, style: 'modern' },
+    { x: 3250, w: 100, h: 440, style: 'glass' },
+    { x: 3370, w: 85, h: 380, style: 'art-deco' },
+    { x: 3480, w: 90, h: 400, style: 'modern' },
+    { x: 3590, w: 75, h: 340, style: 'glass' },
+    { x: 3690, w: 110, h: 480, style: 'glass' },
+    { x: 3820, w: 80, h: 360, style: 'modern' },
+    { x: 3920, w: 95, h: 420, style: 'glass' },
+    { x: 4030, w: 60, h: 280, style: 'art-deco' },
+  ];
+
+  const baseY = canvas.height * 0.78;
+
+  buildingData.forEach((b) => {
+    // Building base with slight gradient
+    const buildGrad = ctx.createLinearGradient(b.x, baseY - b.h, b.x, baseY);
+    if (b.style === 'glass') {
+      buildGrad.addColorStop(0, '#1a2a3a');
+      buildGrad.addColorStop(1, '#0a1520');
+    } else if (b.style === 'salesforce') {
+      buildGrad.addColorStop(0, '#2a3a4a');
+      buildGrad.addColorStop(1, '#151f2a');
+    } else {
+      buildGrad.addColorStop(0, '#151520');
+      buildGrad.addColorStop(1, '#0a0a10');
+    }
+    ctx.fillStyle = buildGrad;
+    ctx.fillRect(b.x, baseY - b.h, b.w, b.h);
+
+    // Window grids with varied colors
+    const windowColors = ['#ffeaa7', '#ffe066', '#fff5cc', '#ffd700', '#ffffff'];
+    const windowRows = Math.floor(b.h / 12);
+    const windowCols = Math.floor(b.w / 10);
+    for (let row = 0; row < windowRows; row++) {
+      for (let col = 0; col < windowCols; col++) {
+        if (Math.random() > 0.35) {
+          const brightness = Math.random();
+          if (brightness > 0.7) {
+            ctx.fillStyle = windowColors[Math.floor(Math.random() * windowColors.length)];
+            ctx.globalAlpha = 0.6 + Math.random() * 0.4;
+          } else {
+            ctx.fillStyle = '#ffeaa7';
+            ctx.globalAlpha = 0.3 + Math.random() * 0.3;
+          }
+          ctx.fillRect(b.x + 3 + col * 10, baseY - b.h + 6 + row * 12, 5, 7);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Building edge highlights
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(b.x, baseY - b.h, b.w, b.h);
+  });
+
+  // Transamerica pyramid with detail
+  ctx.fillStyle = '#0f0f20';
+  ctx.beginPath();
+  ctx.moveTo(1800, baseY);
+  ctx.lineTo(1720, baseY);
+  ctx.lineTo(1760, baseY - 580);
+  ctx.lineTo(1800, baseY);
+  ctx.fill();
+
+  // Pyramid windows
+  ctx.fillStyle = '#ffeaa7';
+  for (let row = 0; row < 35; row++) {
+    const rowY = baseY - 50 - row * 15;
+    const rowWidth = 80 - row * 2;
+    const startX = 1760 - rowWidth / 2;
+    for (let col = 0; col < Math.floor(rowWidth / 12); col++) {
+      if (Math.random() > 0.4) {
+        ctx.globalAlpha = 0.4 + Math.random() * 0.5;
+        ctx.fillRect(startX + col * 12, rowY, 5, 8);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // Golden Gate Bridge with more detail
+  const bridgeX = 100;
+  const bridgeY = baseY - 120;
+
+  // Tower shadows
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+  ctx.fillRect(bridgeX + 10, bridgeY + 20, 30, 180);
+  ctx.fillRect(bridgeX + 410, bridgeY + 20, 30, 180);
+
+  // Main towers
+  ctx.fillStyle = '#8b2500';
+  ctx.fillRect(bridgeX, bridgeY - 180, 40, 300);
+  ctx.fillRect(bridgeX + 400, bridgeY - 180, 40, 300);
+
+  // Tower details
+  ctx.fillStyle = '#a03000';
+  ctx.fillRect(bridgeX + 5, bridgeY - 175, 30, 290);
+  ctx.fillRect(bridgeX + 405, bridgeY - 175, 30, 290);
+
+  // Main cables
+  ctx.strokeStyle = '#c04020';
+  ctx.lineWidth = 8;
+  ctx.beginPath();
+  ctx.moveTo(bridgeX + 20, bridgeY - 170);
+  ctx.quadraticCurveTo(bridgeX + 220, bridgeY - 80, bridgeX + 420, bridgeY - 170);
+  ctx.stroke();
+
+  // Suspender cables
+  ctx.strokeStyle = 'rgba(180, 60, 30, 0.6)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 20; i++) {
+    const x = bridgeX + 40 + i * 20;
+    const cableY = bridgeY - 170 + Math.pow((i - 10) / 10, 2) * 90;
+    ctx.beginPath();
+    ctx.moveTo(x, cableY);
+    ctx.lineTo(x, bridgeY + 80);
+    ctx.stroke();
+  }
+
+  // Road deck
+  ctx.fillStyle = '#4a3020';
+  ctx.fillRect(bridgeX - 20, bridgeY + 80, 480, 20);
+
+  // Stars with twinkling effect
+  for (let i = 0; i < 300; i++) {
+    const x = Math.random() * canvas.width;
+    const y = Math.random() * canvas.height * 0.45;
+    const size = Math.random() * 2.5;
+    const brightness = 0.3 + Math.random() * 0.7;
+
+    ctx.fillStyle = `rgba(255, 255, 255, ${brightness})`;
+    ctx.beginPath();
+    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Star glow
+    if (size > 1.5) {
+      ctx.fillStyle = `rgba(255, 255, 255, ${brightness * 0.2})`;
+      ctx.beginPath();
+      ctx.arc(x, y, size * 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Moon
+  ctx.fillStyle = '#fffaed';
+  ctx.beginPath();
+  ctx.arc(3600, 200, 60, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Moon glow
+  const moonGlow = ctx.createRadialGradient(3600, 200, 60, 3600, 200, 150);
+  moonGlow.addColorStop(0, 'rgba(255, 250, 230, 0.3)');
+  moonGlow.addColorStop(1, 'rgba(255, 250, 230, 0)');
+  ctx.fillStyle = moonGlow;
+  ctx.beginPath();
+  ctx.arc(3600, 200, 150, 0, Math.PI * 2);
+  ctx.fill();
 
   return canvas;
 }
 
 function createOfficeInterior() {
   const group = new THREE.Group();
-  group.position.set(0, 0, -10);
 
   const room = {
-    width: 28,
-    height: 9,
-    depth: 18
+    width: 50,
+    height: 12,
+    depth: 40
   };
 
-  const wallMat = new THREE.MeshStandardMaterial({
-    color: 0xe6e1d7,
-    roughness: 0.9
-  });
-  const floorMat = new THREE.MeshStandardMaterial({
-    color: 0xb88b5c,
+  // Materials
+  const concreteFloorMat = new THREE.MeshStandardMaterial({
+    color: 0x4a4a4a,
     roughness: 0.8
   });
-  const ceilingMat = new THREE.MeshStandardMaterial({
-    color: 0xf2f2ef,
-    roughness: 0.95
+  const polishedConcreteMat = new THREE.MeshStandardMaterial({
+    color: 0x606060,
+    roughness: 0.3,
+    metalness: 0.1
+  });
+  const whiteMat = new THREE.MeshStandardMaterial({
+    color: 0xfafafa,
+    roughness: 0.9
+  });
+  const darkAccentMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1a2e,
+    roughness: 0.5
+  });
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x87ceeb,
+    transparent: true,
+    opacity: 0.2,
+    roughness: 0.05,
+    metalness: 0.1
+  });
+  const steelMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.3,
+    metalness: 0.8
+  });
+  const warmWoodMat = new THREE.MeshStandardMaterial({
+    color: 0xc9a66b,
+    roughness: 0.6
+  });
+  const tealAccentMat = new THREE.MeshStandardMaterial({
+    color: 0x00b894,
+    roughness: 0.4,
+    metalness: 0.2
   });
 
+  // Floor
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(room.width, room.depth),
-    floorMat
+    polishedConcreteMat
   );
   floor.rotation.x = -Math.PI / 2;
-  floor.position.y = 0.02;
+  floor.position.y = 0.01;
   group.add(floor);
 
+  // Ceiling with exposed beams
   const ceiling = new THREE.Mesh(
     new THREE.PlaneGeometry(room.width, room.depth),
-    ceilingMat
+    whiteMat
   );
   ceiling.rotation.x = Math.PI / 2;
   ceiling.position.y = room.height;
   group.add(ceiling);
 
-  const backWall = new THREE.Mesh(
-    new THREE.PlaneGeometry(room.width, room.height),
-    wallMat
-  );
-  backWall.position.set(0, room.height / 2, -room.depth / 2);
-  group.add(backWall);
+  // Exposed ceiling beams
+  const beamMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.7 });
+  for (let i = -20; i <= 20; i += 8) {
+    const beam = new THREE.Mesh(new THREE.BoxGeometry(1, 0.8, room.depth), beamMat);
+    beam.position.set(i, room.height - 0.4, 0);
+    group.add(beam);
+  }
 
-  const leftWall = new THREE.Mesh(
-    new THREE.PlaneGeometry(room.depth, room.height),
-    wallMat
-  );
-  leftWall.rotation.y = Math.PI / 2;
-  leftWall.position.set(-room.width / 2, room.height / 2, 0);
-  group.add(leftWall);
+  // SF Skyline backdrop texture
+  const skylineTexture = new THREE.CanvasTexture(createSkylineBackdrop());
 
+  // Window panes with skyline - placed BEHIND the frame to avoid z-fighting
+  const windowMat = new THREE.MeshStandardMaterial({
+    map: skylineTexture,
+    side: THREE.DoubleSide
+  });
+  const backWindow = new THREE.Mesh(
+    new THREE.PlaneGeometry(room.width + 4, room.height + 2),
+    windowMat
+  );
+  backWindow.position.set(0, room.height / 2, -room.depth / 2 - 1);
+  group.add(backWindow);
+
+  // Back wall - floor to ceiling window frame (in front of skyline)
+  const backWindowFrame = new THREE.Mesh(
+    new THREE.BoxGeometry(room.width, room.height, 0.3),
+    steelMat
+  );
+  backWindowFrame.position.set(0, room.height / 2, -room.depth / 2);
+  group.add(backWindowFrame);
+
+  // Vertical window dividers
+  for (let i = -20; i <= 20; i += 5) {
+    const divider = new THREE.Mesh(new THREE.BoxGeometry(0.15, room.height, 0.4), steelMat);
+    divider.position.set(i, room.height / 2, -room.depth / 2);
+    group.add(divider);
+  }
+
+  // Left window section - placed behind the wall
+  const leftWindow = new THREE.Mesh(
+    new THREE.PlaneGeometry(room.depth * 0.7, room.height + 2),
+    windowMat
+  );
+  leftWindow.rotation.y = Math.PI / 2;
+  leftWindow.position.set(-room.width / 2 - 1, room.height / 2, -room.depth * 0.1);
+  group.add(leftWindow);
+
+  // Left wall - partial with windows (in front)
+  const leftWallSolid = new THREE.Mesh(
+    new THREE.PlaneGeometry(room.depth * 0.4, room.height),
+    whiteMat
+  );
+  leftWallSolid.rotation.y = Math.PI / 2;
+  leftWallSolid.position.set(-room.width / 2, room.height / 2, room.depth * 0.3);
+  group.add(leftWallSolid);
+
+  // Right wall - solid with art
   const rightWall = new THREE.Mesh(
     new THREE.PlaneGeometry(room.depth, room.height),
-    wallMat
+    whiteMat
   );
   rightWall.rotation.y = -Math.PI / 2;
   rightWall.position.set(room.width / 2, room.height / 2, 0);
   group.add(rightWall);
 
-  const baseMat = new THREE.MeshStandardMaterial({
-    color: 0x4a4a4a,
-    roughness: 0.7
-  });
-  const base = new THREE.Mesh(
-    new THREE.BoxGeometry(room.width + 1, 0.4, room.depth + 1),
-    baseMat
+  // Front wall - fully enclosed with entrance
+  const frontWallLeft = new THREE.Mesh(
+    new THREE.PlaneGeometry(room.width / 2 - 3, room.height),
+    whiteMat
   );
-  base.position.set(0, -0.2, -0.2);
-  group.add(base);
+  frontWallLeft.rotation.y = Math.PI;
+  frontWallLeft.position.set(-room.width / 4 - 1.5, room.height / 2, room.depth / 2);
+  group.add(frontWallLeft);
 
-  const windowMat = new THREE.MeshStandardMaterial({
-    color: 0x9fd3ff,
-    roughness: 0.15,
-    metalness: 0.3,
-    transparent: true,
-    opacity: 0.65
-  });
+  const frontWallRight = new THREE.Mesh(
+    new THREE.PlaneGeometry(room.width / 2 - 3, room.height),
+    whiteMat
+  );
+  frontWallRight.rotation.y = Math.PI;
+  frontWallRight.position.set(room.width / 4 + 1.5, room.height / 2, room.depth / 2);
+  group.add(frontWallRight);
 
-  const window = new THREE.Mesh(new THREE.PlaneGeometry(6, 3), windowMat);
-  window.position.set(0, room.height * 0.6, -room.depth / 2 + 0.02);
-  group.add(window);
+  const frontWallTop = new THREE.Mesh(
+    new THREE.PlaneGeometry(6, room.height - 4),
+    whiteMat
+  );
+  frontWallTop.rotation.y = Math.PI;
+  frontWallTop.position.set(0, room.height - 2, room.depth / 2);
+  group.add(frontWallTop);
 
-  const accentMat = new THREE.MeshStandardMaterial({
-    color: 0x2bb3a7,
-    roughness: 0.4
-  });
-  const stripe = new THREE.Mesh(new THREE.PlaneGeometry(room.width, 0.4), accentMat);
-  stripe.position.set(0, 2.2, -room.depth / 2 + 0.03);
-  group.add(stripe);
+  // Glass entrance doors
+  const entranceDoor = new THREE.Mesh(new THREE.PlaneGeometry(6, 4), glassMat);
+  entranceDoor.rotation.y = Math.PI;
+  entranceDoor.position.set(0, 2, room.depth / 2 - 0.1);
+  group.add(entranceDoor);
 
-  const panelMat = new THREE.MeshStandardMaterial({
-    color: 0xf8f5ed,
-    emissive: 0xf0e4b0,
-    emissiveIntensity: 0.6
-  });
-  const panel = new THREE.Mesh(new THREE.PlaneGeometry(6, 2), panelMat);
-  panel.position.set(0, room.height - 0.2, -2);
-  panel.rotation.x = Math.PI / 2;
-  group.add(panel);
+  // Modern reception desk near entrance
+  const receptionDesk = createModernDesk(6, 1.1, 2);
+  receptionDesk.position.set(0, 0, room.depth / 2 - 5);
+  group.add(receptionDesk);
 
-  const warmLight = new THREE.PointLight(0xfff1d2, 0.7, 30);
-  warmLight.position.set(0, room.height - 0.6, -2);
-  group.add(warmLight);
-
-  const coolLight = new THREE.PointLight(0xd2f2ff, 0.5, 25);
-  coolLight.position.set(-8, room.height - 0.6, -6);
-  group.add(coolLight);
-
+  // Work desk clusters
   const deskPositions = [
-    [-7, -2, 0],
-    [7, -2, 0],
-    [-7, -6, Math.PI],
-    [7, -6, Math.PI]
+    { x: -15, z: 5, rotation: 0 },
+    { x: -15, z: -5, rotation: Math.PI },
+    { x: -8, z: 5, rotation: 0 },
+    { x: -8, z: -5, rotation: Math.PI },
+    { x: 8, z: 5, rotation: 0 },
+    { x: 8, z: -5, rotation: Math.PI },
+    { x: 15, z: 5, rotation: 0 },
+    { x: 15, z: -5, rotation: Math.PI }
   ];
 
-  deskPositions.forEach(([x, z, rotation]) => {
-    const desk = createDesk();
-    desk.position.set(x, 0, z);
-    desk.rotation.y = rotation;
+  deskPositions.forEach((pos) => {
+    const desk = createModernDesk(2.4, 0.75, 1.2);
+    desk.position.set(pos.x, 0, pos.z);
+    desk.rotation.y = pos.rotation;
     group.add(desk);
+
+    const chair = createModernChair();
+    chair.position.set(pos.x, 0, pos.z + (pos.rotation === 0 ? 1.2 : -1.2));
+    chair.rotation.y = pos.rotation;
+    group.add(chair);
   });
 
-  const board = createWhiteboard();
-  board.position.set(0, 4.8, -room.depth / 2 + 0.06);
-  group.add(board);
+  // Lounge area with couches
+  const loungeArea = createLoungeArea();
+  loungeArea.position.set(18, 0, 8);
+  group.add(loungeArea);
+
+  // Kitchen/break area
+  const kitchen = createKitchenArea();
+  kitchen.position.set(-18, 0, 8);
+  group.add(kitchen);
+
+  // BOARDROOM - large glass-walled conference room
+  const boardroom = createBoardroom();
+  boardroom.position.set(0, 0, -14);
+  group.add(boardroom);
+
+  // MEETING ROOMS - smaller glass pods along left side
+  const meetingRoom1 = createMeetingRoom('SYNC');
+  meetingRoom1.position.set(-20, 0, -4);
+  group.add(meetingRoom1);
+
+  const meetingRoom2 = createMeetingRoom('FOCUS');
+  meetingRoom2.position.set(-20, 0, 2);
+  group.add(meetingRoom2);
+
+  // PRIVATE OFFICES - along right wall
+  const office1 = createPrivateOffice('CEO');
+  office1.position.set(20, 0, -4);
+  group.add(office1);
+
+  const office2 = createPrivateOffice('CTO');
+  office2.position.set(20, 0, 2);
+  group.add(office2);
+
+  const office3 = createPrivateOffice('CFO');
+  office3.position.set(20, 0, -10);
+  group.add(office3);
+
+  // Large wall art on right wall
+  const artFrame = new THREE.Mesh(new THREE.BoxGeometry(0.1, 4, 8), steelMat);
+  artFrame.position.set(room.width / 2 - 0.1, 5, 0);
+  group.add(artFrame);
+
+  const artCanvas = new THREE.Mesh(
+    new THREE.PlaneGeometry(7.5, 3.5),
+    new THREE.MeshStandardMaterial({ color: 0xff6b6b, roughness: 0.9 })
+  );
+  artCanvas.rotation.y = -Math.PI / 2;
+  artCanvas.position.set(room.width / 2 - 0.2, 5, 0);
+  group.add(artCanvas);
+
+  // Neon sign
+  const neonMat = new THREE.MeshStandardMaterial({
+    color: 0x00ff88,
+    emissive: 0x00ff88,
+    emissiveIntensity: 2
+  });
+  const neonText = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.3, 4), neonMat);
+  neonText.position.set(room.width / 2 - 0.3, 8, -8);
+  group.add(neonText);
+
+  // Indoor plants
+  const plantPositions = [
+    { x: -22, z: 15 },
+    { x: 22, z: 15 },
+    { x: -22, z: -15 },
+    { x: 22, z: -15 },
+    { x: 0, z: -15 }
+  ];
+  plantPositions.forEach((pos) => {
+    const plant = createPlant();
+    plant.position.set(pos.x, 0, pos.z);
+    group.add(plant);
+  });
+
+  // Lighting - industrial pendant lights
+  const lightPositions = [
+    { x: -15, z: 0 },
+    { x: 0, z: 0 },
+    { x: 15, z: 0 },
+    { x: -15, z: -10 },
+    { x: 0, z: -10 },
+    { x: 15, z: -10 },
+    { x: 0, z: 10 }
+  ];
+
+  lightPositions.forEach((pos) => {
+    const pendantLight = createPendantLight();
+    pendantLight.position.set(pos.x, room.height - 1.5, pos.z);
+    group.add(pendantLight);
+
+    const pointLight = new THREE.PointLight(0xfff5e6, 0.6, 15);
+    pointLight.position.set(pos.x, room.height - 2, pos.z);
+    group.add(pointLight);
+  });
+
+  // Ambient light from windows
+  const windowLight = new THREE.RectAreaLight(0xffeedd, 1.5, room.width, room.height);
+  windowLight.position.set(0, room.height / 2, -room.depth / 2 + 1);
+  windowLight.lookAt(0, room.height / 2, 0);
+  group.add(windowLight);
 
   scene.add(group);
+  return group;
 }
 
-function createDesk() {
+function createModernDesk(width, height, depth) {
   const desk = new THREE.Group();
 
   const topMat = new THREE.MeshStandardMaterial({
-    color: 0x7d593c,
-    roughness: 0.6
+    color: 0xf5f5f5,
+    roughness: 0.3
   });
-  const top = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.12, 1.2), topMat);
-  top.position.y = 1.0;
+  const legMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.4,
+    metalness: 0.6
+  });
+
+  const top = new THREE.Mesh(new THREE.BoxGeometry(width, 0.05, depth), topMat);
+  top.position.y = height;
   desk.add(top);
 
-  const legMat = new THREE.MeshStandardMaterial({
-    color: 0x3a2a1d,
-    roughness: 0.8
-  });
-  const legGeo = new THREE.BoxGeometry(0.12, 1.0, 0.12);
-  const legPositions = [
-    [-1.1, 0.5, -0.5],
-    [1.1, 0.5, -0.5],
-    [-1.1, 0.5, 0.5],
-    [1.1, 0.5, 0.5]
+  // Modern A-frame legs
+  const legGeo = new THREE.BoxGeometry(0.08, height, 0.08);
+  const positions = [
+    [-width / 2 + 0.1, height / 2, -depth / 2 + 0.1],
+    [width / 2 - 0.1, height / 2, -depth / 2 + 0.1],
+    [-width / 2 + 0.1, height / 2, depth / 2 - 0.1],
+    [width / 2 - 0.1, height / 2, depth / 2 - 0.1]
   ];
 
-  legPositions.forEach(([x, y, z]) => {
+  positions.forEach(([x, y, z]) => {
     const leg = new THREE.Mesh(legGeo, legMat);
     leg.position.set(x, y, z);
     desk.add(leg);
   });
 
+  // Monitor
   const monitorMat = new THREE.MeshStandardMaterial({
-    color: 0x1c2026,
-    roughness: 0.4,
-    metalness: 0.2
+    color: 0x1a1a1a,
+    roughness: 0.3,
+    metalness: 0.5
   });
-  const monitor = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.5, 0.05), monitorMat);
-  monitor.position.set(0, 1.35, -0.3);
+  const monitor = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.5, 0.03), monitorMat);
+  monitor.position.set(0, height + 0.35, -depth / 3);
   desk.add(monitor);
 
-  const keyboard = new THREE.Mesh(
-    new THREE.BoxGeometry(0.7, 0.05, 0.3),
-    new THREE.MeshStandardMaterial({ color: 0x2b2e33, roughness: 0.6 })
+  const screen = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.7, 0.4),
+    new THREE.MeshStandardMaterial({ color: 0x4a90d9, emissive: 0x4a90d9, emissiveIntensity: 0.3 })
   );
-  keyboard.position.set(0, 1.05, 0.05);
-  desk.add(keyboard);
-
-  const chair = createChair();
-  chair.position.set(0, 0, 1.1);
-  chair.rotation.y = Math.PI;
-  desk.add(chair);
+  screen.position.set(0, height + 0.35, -depth / 3 + 0.02);
+  desk.add(screen);
 
   return desk;
 }
 
-function createChair() {
+function createModernChair() {
   const chair = new THREE.Group();
+
   const seatMat = new THREE.MeshStandardMaterial({
-    color: 0x2d3b44,
-    roughness: 0.8
+    color: 0x2d3436,
+    roughness: 0.6
+  });
+  const meshMat = new THREE.MeshStandardMaterial({
+    color: 0x636e72,
+    roughness: 0.8,
+    transparent: true,
+    opacity: 0.9
   });
 
-  const seat = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.45, 0.12, 8), seatMat);
-  seat.position.y = 0.6;
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.08, 0.5), seatMat);
+  seat.position.y = 0.5;
   chair.add(seat);
 
-  const back = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.12), seatMat);
-  back.position.set(0, 0.95, -0.25);
+  const back = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.6, 0.05), meshMat);
+  back.position.set(0, 0.85, -0.22);
+  back.rotation.x = 0.1;
   chair.add(back);
 
-  const post = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.08, 0.08, 0.6, 6),
-    new THREE.MeshStandardMaterial({ color: 0x1a2228, roughness: 0.7 })
-  );
-  post.position.y = 0.3;
+  const baseMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1a1a,
+    roughness: 0.3,
+    metalness: 0.7
+  });
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.5, 8), baseMat);
+  post.position.y = 0.25;
   chair.add(post);
+
+  // Star base
+  for (let i = 0; i < 5; i++) {
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.03, 0.05), baseMat);
+    arm.position.y = 0.015;
+    arm.rotation.y = (i * Math.PI * 2) / 5;
+    arm.position.x = Math.sin(arm.rotation.y) * 0.15;
+    arm.position.z = Math.cos(arm.rotation.y) * 0.15;
+    chair.add(arm);
+  }
 
   return chair;
 }
 
-function createWhiteboard() {
-  const board = new THREE.Group();
-  const frameMat = new THREE.MeshStandardMaterial({
-    color: 0x8a8f94,
-    roughness: 0.5
+function createLoungeArea() {
+  const lounge = new THREE.Group();
+
+  const couchMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.8
+  });
+  const cushionMat = new THREE.MeshStandardMaterial({
+    color: 0x636e72,
+    roughness: 0.9
   });
 
-  const frame = new THREE.Mesh(new THREE.BoxGeometry(8, 2.6, 0.08), frameMat);
-  board.add(frame);
+  // L-shaped couch
+  const couchBase = new THREE.Mesh(new THREE.BoxGeometry(4, 0.4, 1.2), couchMat);
+  couchBase.position.set(0, 0.2, 0);
+  lounge.add(couchBase);
+  registerPlatform(couchBase);
 
-  const boardSurface = new THREE.Mesh(
-    new THREE.PlaneGeometry(7.6, 2.2),
-    new THREE.MeshStandardMaterial({ color: 0xf5f3ed, roughness: 0.3 })
+  const couchBack = new THREE.Mesh(new THREE.BoxGeometry(4, 0.6, 0.2), couchMat);
+  couchBack.position.set(0, 0.7, -0.5);
+  lounge.add(couchBack);
+
+  const couchSide = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.4, 2), couchMat);
+  couchSide.position.set(-2.4, 0.2, 0.4);
+  lounge.add(couchSide);
+  registerPlatform(couchSide);
+
+  // Cushions
+  const cushion1 = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.3, 0.5), cushionMat);
+  cushion1.position.set(1.5, 0.55, 0);
+  cushion1.rotation.z = 0.2;
+  lounge.add(cushion1);
+
+  // Coffee table
+  const tableMat = new THREE.MeshStandardMaterial({
+    color: 0xc9a66b,
+    roughness: 0.4
+  });
+  const coffeeTable = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.08, 0.8), tableMat);
+  coffeeTable.position.set(0, 0.45, 1.2);
+  lounge.add(coffeeTable);
+
+  const tableLegs = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.4, 0.6), new THREE.MeshStandardMaterial({ color: 0x1a1a1a }));
+  tableLegs.position.set(0, 0.2, 1.2);
+  lounge.add(tableLegs);
+
+  return lounge;
+}
+
+function createKitchenArea() {
+  const kitchen = new THREE.Group();
+
+  const counterMat = new THREE.MeshStandardMaterial({
+    color: 0xfafafa,
+    roughness: 0.2,
+    metalness: 0.1
+  });
+  const cabinetMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.6
+  });
+
+  // Counter
+  const counter = new THREE.Mesh(new THREE.BoxGeometry(6, 1.1, 0.8), counterMat);
+  counter.position.set(0, 0.55, -1);
+  kitchen.add(counter);
+  registerPlatform(counter);
+
+  // Base cabinets
+  const baseCabinet = new THREE.Mesh(new THREE.BoxGeometry(6, 0.9, 0.7), cabinetMat);
+  baseCabinet.position.set(0, 0.45, -1);
+  kitchen.add(baseCabinet);
+
+  // Upper cabinets
+  const upperCabinet = new THREE.Mesh(new THREE.BoxGeometry(6, 1.2, 0.4), cabinetMat);
+  upperCabinet.position.set(0, 2.5, -1.15);
+  kitchen.add(upperCabinet);
+
+  // Coffee machine
+  const coffeeMachine = new THREE.Mesh(
+    new THREE.BoxGeometry(0.4, 0.5, 0.35),
+    new THREE.MeshStandardMaterial({ color: 0x636e72, metalness: 0.5 })
   );
-  boardSurface.position.z = 0.05;
-  board.add(boardSurface);
+  coffeeMachine.position.set(-2, 1.35, -1);
+  kitchen.add(coffeeMachine);
 
-  return board;
+  // Fridge
+  const fridge = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 2.2, 0.8),
+    new THREE.MeshStandardMaterial({ color: 0xb2bec3, metalness: 0.7 })
+  );
+  fridge.position.set(4, 1.1, -1);
+  kitchen.add(fridge);
+
+  // Bar stools
+  for (let i = -1.5; i <= 1.5; i += 1.5) {
+    const stool = createBarStool();
+    stool.position.set(i, 0, 0.5);
+    kitchen.add(stool);
+  }
+
+  return kitchen;
+}
+
+function createBoardroom() {
+  const room = new THREE.Group();
+  const roomWidth = 12;
+  const roomDepth = 6;
+  const roomHeight = 4;
+
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x88ccff,
+    transparent: true,
+    opacity: 0.25,
+    roughness: 0.05,
+    metalness: 0.1,
+    side: THREE.DoubleSide
+  });
+  const frameMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.3,
+    metalness: 0.7
+  });
+  const floorMat = new THREE.MeshStandardMaterial({
+    color: 0x3a3a4a,
+    roughness: 0.4
+  });
+
+  // Floor
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(roomWidth, roomDepth), floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = 0.02;
+  room.add(floor);
+
+  // Glass walls
+  const frontGlass = new THREE.Mesh(new THREE.PlaneGeometry(roomWidth, roomHeight), glassMat);
+  frontGlass.position.set(0, roomHeight / 2, roomDepth / 2);
+  frontGlass.rotation.y = Math.PI;
+  room.add(frontGlass);
+
+  const leftGlass = new THREE.Mesh(new THREE.PlaneGeometry(roomDepth, roomHeight), glassMat);
+  leftGlass.rotation.y = Math.PI / 2;
+  leftGlass.position.set(-roomWidth / 2, roomHeight / 2, 0);
+  room.add(leftGlass);
+
+  const rightGlass = new THREE.Mesh(new THREE.PlaneGeometry(roomDepth, roomHeight), glassMat);
+  rightGlass.rotation.y = -Math.PI / 2;
+  rightGlass.position.set(roomWidth / 2, roomHeight / 2, 0);
+  room.add(rightGlass);
+
+  // Frame posts
+  const postGeo = new THREE.BoxGeometry(0.1, roomHeight, 0.1);
+  const postPositions = [
+    [-roomWidth / 2, roomHeight / 2, roomDepth / 2],
+    [roomWidth / 2, roomHeight / 2, roomDepth / 2],
+    [-roomWidth / 2, roomHeight / 2, -roomDepth / 2],
+    [roomWidth / 2, roomHeight / 2, -roomDepth / 2]
+  ];
+  postPositions.forEach(([x, y, z]) => {
+    const post = new THREE.Mesh(postGeo, frameMat);
+    post.position.set(x, y, z);
+    room.add(post);
+  });
+
+  // Conference table
+  const tableMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1a1a,
+    roughness: 0.2,
+    metalness: 0.3
+  });
+  const table = new THREE.Mesh(new THREE.BoxGeometry(8, 0.1, 2.5), tableMat);
+  table.position.set(0, 0.75, 0);
+  room.add(table);
+  registerPlatform(table);
+
+  const tableBase = new THREE.Mesh(
+    new THREE.BoxGeometry(6, 0.7, 0.8),
+    new THREE.MeshStandardMaterial({ color: 0x2d3436 })
+  );
+  tableBase.position.set(0, 0.35, 0);
+  room.add(tableBase);
+
+  // Executive chairs around the table
+  const chairPositions = [
+    { x: -3, z: 1.8, rot: Math.PI },
+    { x: -1, z: 1.8, rot: Math.PI },
+    { x: 1, z: 1.8, rot: Math.PI },
+    { x: 3, z: 1.8, rot: Math.PI },
+    { x: -3, z: -1.8, rot: 0 },
+    { x: -1, z: -1.8, rot: 0 },
+    { x: 1, z: -1.8, rot: 0 },
+    { x: 3, z: -1.8, rot: 0 },
+    { x: -4.5, z: 0, rot: Math.PI / 2 },
+    { x: 4.5, z: 0, rot: -Math.PI / 2 }
+  ];
+
+  chairPositions.forEach((pos) => {
+    const chair = createExecutiveChair();
+    chair.position.set(pos.x, 0, pos.z);
+    chair.rotation.y = pos.rot;
+    room.add(chair);
+  });
+
+  // TV Screen on back wall
+  const tvMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1a2e,
+    emissive: 0x4a90d9,
+    emissiveIntensity: 0.3
+  });
+  const tv = new THREE.Mesh(new THREE.BoxGeometry(4, 2.2, 0.1), tvMat);
+  tv.position.set(0, 2.5, -roomDepth / 2 + 0.1);
+  room.add(tv);
+
+  // Room sign
+  const sign = createRoomSign('BOARDROOM');
+  sign.position.set(0, 3.5, roomDepth / 2 + 0.1);
+  room.add(sign);
+
+  // Ceiling light
+  const light = new THREE.PointLight(0xffffff, 0.8, 15);
+  light.position.set(0, 3.8, 0);
+  room.add(light);
+
+  return room;
+}
+
+function createMeetingRoom(name) {
+  const room = new THREE.Group();
+  const roomWidth = 5;
+  const roomDepth = 4;
+  const roomHeight = 3.5;
+
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x88ccff,
+    transparent: true,
+    opacity: 0.3,
+    roughness: 0.05,
+    side: THREE.DoubleSide
+  });
+  const frameMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.3,
+    metalness: 0.7
+  });
+
+  // Floor
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(roomWidth, roomDepth),
+    new THREE.MeshStandardMaterial({ color: 0x4a4a5a, roughness: 0.3 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = 0.02;
+  room.add(floor);
+
+  // Glass walls (front and one side)
+  const frontGlass = new THREE.Mesh(new THREE.PlaneGeometry(roomWidth, roomHeight), glassMat);
+  frontGlass.position.set(0, roomHeight / 2, roomDepth / 2);
+  frontGlass.rotation.y = Math.PI;
+  room.add(frontGlass);
+
+  const sideGlass = new THREE.Mesh(new THREE.PlaneGeometry(roomDepth, roomHeight), glassMat);
+  sideGlass.rotation.y = -Math.PI / 2;
+  sideGlass.position.set(roomWidth / 2, roomHeight / 2, 0);
+  room.add(sideGlass);
+
+  // Corner posts
+  const postGeo = new THREE.BoxGeometry(0.08, roomHeight, 0.08);
+  const corners = [
+    [roomWidth / 2, roomHeight / 2, roomDepth / 2],
+    [roomWidth / 2, roomHeight / 2, -roomDepth / 2]
+  ];
+  corners.forEach(([x, y, z]) => {
+    const post = new THREE.Mesh(postGeo, frameMat);
+    post.position.set(x, y, z);
+    room.add(post);
+  });
+
+  // Small round table
+  const table = new THREE.Mesh(
+    new THREE.CylinderGeometry(1, 1, 0.08, 16),
+    new THREE.MeshStandardMaterial({ color: 0xfafafa, roughness: 0.3 })
+  );
+  table.position.set(0, 0.75, 0);
+  room.add(table);
+  registerPlatform(table);
+
+  const tableLeg = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.15, 0.2, 0.75, 8),
+    new THREE.MeshStandardMaterial({ color: 0x2d3436 })
+  );
+  tableLeg.position.set(0, 0.375, 0);
+  room.add(tableLeg);
+
+  // 4 chairs
+  for (let i = 0; i < 4; i++) {
+    const angle = (i * Math.PI) / 2 + Math.PI / 4;
+    const chair = createModernChair();
+    chair.position.set(Math.cos(angle) * 1.5, 0, Math.sin(angle) * 1.5);
+    chair.rotation.y = angle + Math.PI;
+    room.add(chair);
+  }
+
+  // Room sign
+  const sign = createRoomSign(name);
+  sign.position.set(0, 3, roomDepth / 2 + 0.1);
+  room.add(sign);
+
+  // Light
+  const light = new THREE.PointLight(0xfff5e6, 0.5, 8);
+  light.position.set(0, 3.2, 0);
+  room.add(light);
+
+  return room;
+}
+
+function createPrivateOffice(title) {
+  const office = new THREE.Group();
+  const roomWidth = 5;
+  const roomDepth = 5;
+  const roomHeight = 3.5;
+
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x88ccff,
+    transparent: true,
+    opacity: 0.2,
+    roughness: 0.05,
+    side: THREE.DoubleSide
+  });
+  const wallMat = new THREE.MeshStandardMaterial({
+    color: 0xf5f5f5,
+    roughness: 0.9
+  });
+  const frameMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.3,
+    metalness: 0.7
+  });
+
+  // Floor - nicer carpet
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(roomWidth, roomDepth),
+    new THREE.MeshStandardMaterial({ color: 0x2d3a4a, roughness: 0.9 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = 0.02;
+  office.add(floor);
+
+  // Back wall (solid)
+  const backWall = new THREE.Mesh(new THREE.PlaneGeometry(roomWidth, roomHeight), wallMat);
+  backWall.position.set(0, roomHeight / 2, -roomDepth / 2);
+  office.add(backWall);
+
+  // Side wall (solid)
+  const sideWall = new THREE.Mesh(new THREE.PlaneGeometry(roomDepth, roomHeight), wallMat);
+  sideWall.rotation.y = -Math.PI / 2;
+  sideWall.position.set(roomWidth / 2, roomHeight / 2, 0);
+  office.add(sideWall);
+
+  // Front glass wall with door opening
+  const frontGlass = new THREE.Mesh(new THREE.PlaneGeometry(roomWidth, roomHeight), glassMat);
+  frontGlass.position.set(0, roomHeight / 2, roomDepth / 2);
+  frontGlass.rotation.y = Math.PI;
+  office.add(frontGlass);
+
+  // Executive desk
+  const desk = createModernDesk(2, 0.75, 1);
+  desk.position.set(0, 0, -1.5);
+  office.add(desk);
+
+  // Executive chair behind desk
+  const chair = createExecutiveChair();
+  chair.position.set(0, 0, -2.5);
+  office.add(chair);
+
+  // Guest chairs
+  const guestChair1 = createModernChair();
+  guestChair1.position.set(-1, 0, 0.5);
+  guestChair1.rotation.y = Math.PI;
+  office.add(guestChair1);
+
+  const guestChair2 = createModernChair();
+  guestChair2.position.set(1, 0, 0.5);
+  guestChair2.rotation.y = Math.PI;
+  office.add(guestChair2);
+
+  // Bookshelf on back wall
+  const shelf = new THREE.Mesh(
+    new THREE.BoxGeometry(1.5, 2, 0.3),
+    new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.6 })
+  );
+  shelf.position.set(1.8, 1.5, -roomDepth / 2 + 0.2);
+  office.add(shelf);
+
+  // Books on shelf
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 4; col++) {
+      const bookColor = [0xe74c3c, 0x3498db, 0x27ae60, 0xf39c12, 0x9b59b6][Math.floor(Math.random() * 5)];
+      const book = new THREE.Mesh(
+        new THREE.BoxGeometry(0.25, 0.35, 0.2),
+        new THREE.MeshStandardMaterial({ color: bookColor, roughness: 0.8 })
+      );
+      book.position.set(1.8 - 0.5 + col * 0.35, 0.7 + row * 0.55, -roomDepth / 2 + 0.15);
+      office.add(book);
+    }
+  }
+
+  // Name plate
+  const sign = createRoomSign(title);
+  sign.position.set(0, 2.8, roomDepth / 2 + 0.1);
+  office.add(sign);
+
+  // Ambient light
+  const light = new THREE.PointLight(0xfff5e6, 0.6, 10);
+  light.position.set(0, 3.2, 0);
+  office.add(light);
+
+  return office;
+}
+
+function createExecutiveChair() {
+  const chair = new THREE.Group();
+
+  const leatherMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1a1a,
+    roughness: 0.4
+  });
+  const chromeMat = new THREE.MeshStandardMaterial({
+    color: 0xaaaaaa,
+    roughness: 0.2,
+    metalness: 0.9
+  });
+
+  // Seat
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.12, 0.5), leatherMat);
+  seat.position.y = 0.55;
+  chair.add(seat);
+  registerPlatform(seat);
+
+  // High back
+  const back = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.8, 0.1), leatherMat);
+  back.position.set(0, 1, -0.22);
+  back.rotation.x = 0.08;
+  chair.add(back);
+
+  // Headrest
+  const headrest = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.2, 0.08), leatherMat);
+  headrest.position.set(0, 1.45, -0.2);
+  chair.add(headrest);
+
+  // Armrests
+  const armGeo = new THREE.BoxGeometry(0.08, 0.05, 0.3);
+  const leftArm = new THREE.Mesh(armGeo, leatherMat);
+  leftArm.position.set(-0.3, 0.7, -0.05);
+  chair.add(leftArm);
+
+  const rightArm = new THREE.Mesh(armGeo, leatherMat);
+  rightArm.position.set(0.3, 0.7, -0.05);
+  chair.add(rightArm);
+
+  // Chrome base
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.5, 8), chromeMat);
+  post.position.y = 0.25;
+  chair.add(post);
+
+  // Star base with wheels
+  for (let i = 0; i < 5; i++) {
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.03, 0.04), chromeMat);
+    arm.position.y = 0.02;
+    arm.rotation.y = (i * Math.PI * 2) / 5;
+    arm.position.x = Math.sin(arm.rotation.y) * 0.18;
+    arm.position.z = Math.cos(arm.rotation.y) * 0.18;
+    chair.add(arm);
+
+    // Wheel
+    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.04, 8), chromeMat);
+    wheel.rotation.z = Math.PI / 2;
+    wheel.position.set(
+      Math.sin(arm.rotation.y) * 0.4,
+      0.02,
+      Math.cos(arm.rotation.y) * 0.4
+    );
+    chair.add(wheel);
+  }
+
+  return chair;
+}
+
+function createRoomSign(text) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width = 256;
+  canvas.height = 64;
+
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.font = 'bold 28px sans-serif';
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  const material = new THREE.MeshBasicMaterial({ map: texture });
+  const sign = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 0.4), material);
+
+  return sign;
+}
+
+function createBarStool() {
+  const stool = new THREE.Group();
+
+  const seatMat = new THREE.MeshStandardMaterial({
+    color: 0xc9a66b,
+    roughness: 0.5
+  });
+  const legMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1a1a,
+    roughness: 0.3,
+    metalness: 0.7
+  });
+
+  const seat = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.08, 16), seatMat);
+  seat.position.y = 0.8;
+  stool.add(seat);
+  registerPlatform(seat);
+
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.75, 8), legMat);
+  post.position.y = 0.4;
+  stool.add(post);
+
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.03, 16), legMat);
+  base.position.y = 0.015;
+  stool.add(base);
+
+  return stool;
+}
+
+function createPlant() {
+  const plant = new THREE.Group();
+
+  const potMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.7
+  });
+  const pot = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.35, 0.6, 12), potMat);
+  pot.position.y = 0.3;
+  plant.add(pot);
+
+  const soilMat = new THREE.MeshStandardMaterial({ color: 0x3d2314, roughness: 1 });
+  const soil = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 0.05, 12), soilMat);
+  soil.position.y = 0.58;
+  plant.add(soil);
+
+  // Leaves
+  const leafMat = new THREE.MeshStandardMaterial({
+    color: 0x27ae60,
+    roughness: 0.8,
+    side: THREE.DoubleSide
+  });
+
+  for (let i = 0; i < 8; i++) {
+    const leaf = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 1.2), leafMat);
+    leaf.position.y = 1.2;
+    leaf.rotation.y = (i * Math.PI) / 4;
+    leaf.rotation.x = -0.3;
+    leaf.rotation.z = Math.sin(i) * 0.2;
+    plant.add(leaf);
+  }
+
+  return plant;
+}
+
+function createPendantLight() {
+  const light = new THREE.Group();
+
+  const cordMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a });
+  const cord = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 1.5, 8), cordMat);
+  cord.position.y = 0.75;
+  light.add(cord);
+
+  const shadeMat = new THREE.MeshStandardMaterial({
+    color: 0x2d3436,
+    roughness: 0.6,
+    side: THREE.DoubleSide
+  });
+  const shade = new THREE.Mesh(new THREE.ConeGeometry(0.4, 0.5, 16, 1, true), shadeMat);
+  shade.position.y = -0.25;
+  shade.rotation.x = Math.PI;
+  light.add(shade);
+
+  return light;
 }
 
 function createOutdoorAccents() {
-  const sculptureMat = new THREE.MeshStandardMaterial({
-    color: 0x235a52,
+  // No outdoor accents - fully enclosed SF office
+}
+
+// ============================================
+// JUMPING PUZZLE PLATFORMS
+// ============================================
+
+function createJumpingPuzzles() {
+  const group = new THREE.Group();
+
+  const platformMat = new THREE.MeshStandardMaterial({
+    color: 0x00b894,
     roughness: 0.4,
-    metalness: 0.2
+    metalness: 0.3
   });
-  const sculpture = new THREE.Mesh(new THREE.TorusGeometry(3.5, 0.2, 8, 24), sculptureMat);
-  sculpture.position.set(-12, 3.5, 10);
-  sculpture.rotation.x = Math.PI / 2.8;
-  scene.add(sculpture);
+  const glowMat = new THREE.MeshStandardMaterial({
+    color: 0x00ff88,
+    emissive: 0x00ff88,
+    emissiveIntensity: 0.5
+  });
 
-  const planterMat = new THREE.MeshStandardMaterial({
-    color: 0x2b3b2f,
-    roughness: 0.8
-  });
-  const planter = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.6, 1, 10), planterMat);
-  planter.position.set(12, 0.5, 6);
-  scene.add(planter);
+  // Platform route along the left side
+  const platformData = [
+    { x: -22, y: 1.5, z: 5, w: 2, d: 2 },
+    { x: -22, y: 2.5, z: 0, w: 1.5, d: 1.5 },
+    { x: -22, y: 3.5, z: -5, w: 1.5, d: 1.5 },
+    { x: -20, y: 4.5, z: -8, w: 2, d: 2 },
+    { x: -16, y: 5.5, z: -10, w: 1.5, d: 1.5 },
+    { x: -12, y: 6.5, z: -12, w: 2, d: 2 },
+    { x: -8, y: 7.5, z: -14, w: 2.5, d: 2.5 }, // Secret viewing platform
+    { x: -4, y: 8, z: -16, w: 2, d: 2 },
+    { x: 0, y: 8.5, z: -17, w: 3, d: 3 }, // Top platform with best view
+  ];
 
-  const leavesMat = new THREE.MeshStandardMaterial({
-    color: 0x3a7a3a,
-    roughness: 0.9
+  platformData.forEach((p, i) => {
+    const platform = new THREE.Mesh(
+      new THREE.BoxGeometry(p.w, 0.2, p.d),
+      platformMat
+    );
+    platform.position.set(p.x, p.y, p.z);
+    group.add(platform);
+    registerPlatform(platform);
+
+    // Glow edge
+    const edge = new THREE.Mesh(
+      new THREE.BoxGeometry(p.w + 0.1, 0.05, p.d + 0.1),
+      glowMat
+    );
+    edge.position.set(p.x, p.y - 0.1, p.z);
+    group.add(edge);
   });
-  const leaves = new THREE.Mesh(new THREE.SphereGeometry(2, 8, 8), leavesMat);
-  leaves.position.set(12, 2.4, 6);
-  scene.add(leaves);
+
+  // Right side challenge route - harder jumps
+  const hardPlatforms = [
+    { x: 22, y: 2, z: 5, w: 1.2, d: 1.2 },
+    { x: 20, y: 3, z: 2, w: 1, d: 1 },
+    { x: 22, y: 4, z: -1, w: 1, d: 1 },
+    { x: 20, y: 5, z: -4, w: 1.2, d: 1.2 },
+    { x: 18, y: 6, z: -7, w: 1, d: 1 },
+    { x: 20, y: 7, z: -10, w: 1.5, d: 1.5 },
+    { x: 22, y: 8, z: -13, w: 2, d: 2 }, // Reward platform
+  ];
+
+  const hardPlatformMat = new THREE.MeshStandardMaterial({
+    color: 0xe17055,
+    roughness: 0.4,
+    metalness: 0.3
+  });
+  const hardGlowMat = new THREE.MeshStandardMaterial({
+    color: 0xff6b6b,
+    emissive: 0xff6b6b,
+    emissiveIntensity: 0.5
+  });
+
+  hardPlatforms.forEach((p) => {
+    const platform = new THREE.Mesh(
+      new THREE.BoxGeometry(p.w, 0.2, p.d),
+      hardPlatformMat
+    );
+    platform.position.set(p.x, p.y, p.z);
+    group.add(platform);
+    registerPlatform(platform);
+
+    const edge = new THREE.Mesh(
+      new THREE.BoxGeometry(p.w + 0.1, 0.05, p.d + 0.1),
+      hardGlowMat
+    );
+    edge.position.set(p.x, p.y - 0.1, p.z);
+    group.add(edge);
+  });
+
+  // Center floating sculpture you can climb
+  const sculptureBase = new THREE.Mesh(
+    new THREE.BoxGeometry(3, 0.3, 3),
+    new THREE.MeshStandardMaterial({ color: 0x6c5ce7, roughness: 0.3 })
+  );
+  sculptureBase.position.set(0, 4, 0);
+  group.add(sculptureBase);
+  registerPlatform(sculptureBase);
+
+  const sculptureTop = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 0.3, 2),
+    new THREE.MeshStandardMaterial({ color: 0xa29bfe, roughness: 0.3 })
+  );
+  sculptureTop.position.set(0, 5.5, 0);
+  group.add(sculptureTop);
+  registerPlatform(sculptureTop);
+
+  // Floating ring decoration
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(1.5, 0.15, 8, 24),
+    new THREE.MeshStandardMaterial({
+      color: 0xffeaa7,
+      emissive: 0xffeaa7,
+      emissiveIntensity: 0.3
+    })
+  );
+  ring.position.set(0, 6.5, 0);
+  ring.rotation.x = Math.PI / 2;
+  group.add(ring);
+
+  scene.add(group);
+}
+
+// ============================================
+// SECRETS - DUCK TO SEE
+// ============================================
+
+function createSecrets() {
+  const group = new THREE.Group();
+
+  const secretMat = new THREE.MeshStandardMaterial({
+    color: 0xffeaa7,
+    emissive: 0xffeaa7,
+    emissiveIntensity: 0.8
+  });
+
+  // Secret 1: Under the reception desk
+  const secret1 = createSecretMessage('WELCOME TO SF', 0.15);
+  secret1.position.set(0, 0.3, 15);
+  secret1.rotation.x = -Math.PI / 2;
+  group.add(secret1);
+
+  // Secret 2: Behind a plant pot - duck to see through the gap
+  const secret2 = createSecretMessage('HIDDEN GEM', 0.12);
+  secret2.position.set(-22, 0.4, -15.5);
+  secret2.rotation.y = Math.PI / 2;
+  group.add(secret2);
+
+  // Secret 3: Under a desk cluster
+  const secret3 = createSecretMessage('KEEP EXPLORING', 0.1);
+  secret3.position.set(-15, 0.25, 5);
+  secret3.rotation.x = -Math.PI / 2;
+  group.add(secret3);
+
+  // Secret 4: Under the kitchen counter
+  const secret4 = createSecretMessage('COFFEE BREAK', 0.12);
+  secret4.position.set(-18, 0.3, -12);
+  secret4.rotation.x = -Math.PI / 2;
+  group.add(secret4);
+
+  // Secret 5: Under the couch in lounge
+  const secret5 = createSecretMessage('NAP TIME?', 0.1);
+  secret5.position.set(18, 0.2, -12);
+  secret5.rotation.x = -Math.PI / 2;
+  group.add(secret5);
+
+  // Secret 6: Tiny message visible only when ducking under jumping platform
+  const secret6 = createSecretMessage('YOU FOUND ME!', 0.08);
+  secret6.position.set(-8, 7.3, -14);
+  secret6.rotation.x = Math.PI;
+  group.add(secret6);
+
+  // Secret 7: Hidden in a corner - need to duck and look
+  const secret7Box = new THREE.Mesh(
+    new THREE.BoxGeometry(0.5, 0.5, 0.5),
+    new THREE.MeshStandardMaterial({
+      color: 0x00ff88,
+      emissive: 0x00ff88,
+      emissiveIntensity: 1
+    })
+  );
+  secret7Box.position.set(24, 0.25, 19);
+  group.add(secret7Box);
+
+  // Secret 8: Under the art installation
+  const secret8 = createSecretMessage('ART IS EVERYWHERE', 0.08);
+  secret8.position.set(24, 0.4, 0);
+  secret8.rotation.y = -Math.PI / 2;
+  group.add(secret8);
+
+  scene.add(group);
+}
+
+function createSecretMessage(text, size) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width = 512;
+  canvas.height = 128;
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.font = 'bold 48px monospace';
+  ctx.fillStyle = '#ffeaa7';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    side: THREE.DoubleSide
+  });
+
+  const aspect = canvas.width / canvas.height;
+  const plane = new THREE.Mesh(
+    new THREE.PlaneGeometry(size * aspect * 4, size * 4),
+    material
+  );
+
+  return plane;
 }

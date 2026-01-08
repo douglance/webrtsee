@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebRTSee Office</title>
+    <title>SF Skyline Office</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -16,11 +16,19 @@
     <div id="overlay">
       <div class="panel">
         <div class="badge">LIVE WEBRTC</div>
-        <h1>Grasslands Office</h1>
+        <h1>SF Skyline Office</h1>
         <p>
-          A grassy outdoor meet-up with an open office interior. Your webcam
-          becomes your character in the shared space.
+          A sleek tech office with stunning SF views. Explore jumping puzzles,
+          find hidden secrets by crouching. Your webcam becomes your avatar.
         </p>
+        <label for="nameInput">Display Name</label>
+        <input
+          id="nameInput"
+          type="text"
+          value=""
+          maxlength="24"
+          autocomplete="name"
+        />
         <label for="roomInput">Lobby Code</label>
         <div class="row">
           <input
@@ -38,10 +46,10 @@
           <button id="copyCodeBtn">Copy Code</button>
         </div>
         <div class="tips">
-          <span>Click scene to lock cursor</span>
-          <span>WASD + mouse to move</span>
-          <span>Use Share Screen to broadcast</span>
-          <span>Copy invite link to share</span>
+          <span>WASD to move, mouse to look</span>
+          <span>SPACE to jump, SHIFT to duck</span>
+          <span>Find 8 hidden secrets!</span>
+          <span>Climb the jumping puzzles</span>
         </div>
       </div>
     </div>
@@ -52,6 +60,7 @@
       <div id="toolbar">
         <button id="shareBtn" disabled>Share Screen</button>
         <button id="moveShareBtn" disabled>Move Screen</button>
+        <button id="faceZoomBtn" disabled>Face Zoom Off</button>
         <button id="muteBtn" disabled>Mute Mic</button>
         <div class="slider">
           <label for="masterVolume">Volume</label>
@@ -66,7 +75,26 @@
           />
         </div>
       </div>
-      <video id="localVideo" autoplay playsinline muted></video>
+      <div id="localIdentity">
+        <video id="localVideo" autoplay playsinline muted></video>
+        <input
+          id="nameHudInput"
+          type="text"
+          maxlength="24"
+          placeholder="Add your name"
+          autocomplete="off"
+          aria-label="Your name"
+        />
+      </div>
+    </div>
+
+    <div id="mobileControls" aria-hidden="true">
+      <div id="moveStick" class="joystick-zone"></div>
+      <div id="lookStick" class="joystick-zone"></div>
+      <div class="mobile-buttons">
+        <button id="jumpBtn" type="button">Jump</button>
+        <button id="crouchBtn" type="button">Crouch</button>
+      </div>
     </div>
 
     <div id="volumePopup" class="hidden">
@@ -75,6 +103,8 @@
       <button id="mutePeerBtn">Mute</button>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/nipplejs@0.10.1/dist/nipplejs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js"></script>
     <script type="importmap">
       {
         "imports": {

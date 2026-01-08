@@ -18,6 +18,13 @@ function sanitizeRoomName(value) {
   return cleaned || 'lobby';
 }
 
+function sanitizeDisplayName(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim().slice(0, 24);
+}
+
 export class Room {
   constructor(state, env) {
     this.state = state;
@@ -25,6 +32,7 @@ export class Room {
     this.clients = new Map();
     this.joined = new Set();
     this.shares = new Map();
+    this.names = new Map();
   }
 
   async fetch(request) {
@@ -83,9 +91,11 @@ export class Room {
     if (this.joined.has(clientId)) {
       this.joined.delete(clientId);
       this.shares.delete(clientId);
+      this.names.delete(clientId);
       this.broadcast({ type: 'peer-left', id: clientId }, clientId);
     } else {
       this.shares.delete(clientId);
+      this.names.delete(clientId);
     }
   }
 
@@ -101,6 +111,7 @@ export class Room {
       if (this.joined.has(clientId)) {
         return;
       }
+      const name = sanitizeDisplayName(msg.name);
       const peers = Array.from(this.joined);
       const shares = peers
         .map((peerId) => {
@@ -111,17 +122,40 @@ export class Room {
           return { id: peerId, trackId: share.trackId, position: share.position };
         })
         .filter(Boolean);
+      const names = peers.reduce((acc, peerId) => {
+        const peerName = this.names.get(peerId);
+        if (peerName) {
+          acc[peerId] = peerName;
+        }
+        return acc;
+      }, {});
 
       this.joined.add(clientId);
+      if (name) {
+        this.names.set(clientId, name);
+      } else {
+        this.names.delete(clientId);
+      }
       const ws = this.clients.get(clientId);
       if (ws) {
-        this.safeSend(ws, { type: 'peers', peers, shares });
+        this.safeSend(ws, { type: 'peers', peers, shares, names });
       }
-      this.broadcast({ type: 'peer-joined', id: clientId }, clientId);
+      this.broadcast({ type: 'peer-joined', id: clientId, name }, clientId);
       return;
     }
 
     if (!this.joined.has(clientId)) {
+      return;
+    }
+
+    if (msg.type === 'name-update') {
+      const name = sanitizeDisplayName(msg.name);
+      if (name) {
+        this.names.set(clientId, name);
+      } else {
+        this.names.delete(clientId);
+      }
+      this.broadcast({ type: 'name-update', id: clientId, name }, clientId);
       return;
     }
 

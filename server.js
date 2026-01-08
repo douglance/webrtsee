@@ -11,8 +11,16 @@ const wss = new WebSocketServer({ server });
 const clients = new Map();
 const rooms = new Map();
 const shares = new Map();
+const names = new Map();
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+function sanitizeDisplayName(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim().slice(0, 24);
+}
 
 function safeSend(ws, payload) {
   if (ws.readyState === ws.OPEN) {
@@ -49,6 +57,7 @@ function leaveRoom(ws) {
   }
   broadcast(ws.room, { type: 'peer-left', id: ws.id }, ws.id);
   shares.delete(ws.id);
+  names.delete(ws.id);
   ws.room = null;
 }
 
@@ -69,6 +78,7 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'join') {
       const roomId = typeof msg.room === 'string' && msg.room.trim() ? msg.room.trim() : 'lobby';
+      const name = sanitizeDisplayName(msg.name);
       const room = rooms.get(roomId) || new Set();
       const peers = Array.from(room);
       const shareInfo = peers
@@ -80,12 +90,38 @@ wss.on('connection', (ws) => {
           return { id: peerId, trackId: share.trackId, position: share.position };
         })
         .filter(Boolean);
+      const peerNames = peers.reduce((acc, peerId) => {
+        const peerName = names.get(peerId);
+        if (peerName) {
+          acc[peerId] = peerName;
+        }
+        return acc;
+      }, {});
       room.add(ws.id);
       rooms.set(roomId, room);
       ws.room = roomId;
+      if (name) {
+        names.set(ws.id, name);
+      } else {
+        names.delete(ws.id);
+      }
 
-      safeSend(ws, { type: 'peers', peers, shares: shareInfo });
-      broadcast(roomId, { type: 'peer-joined', id: ws.id }, ws.id);
+      safeSend(ws, { type: 'peers', peers, shares: shareInfo, names: peerNames });
+      broadcast(roomId, { type: 'peer-joined', id: ws.id, name }, ws.id);
+      return;
+    }
+
+    if (msg.type === 'name-update') {
+      if (!ws.room) {
+        return;
+      }
+      const name = sanitizeDisplayName(msg.name);
+      if (name) {
+        names.set(ws.id, name);
+      } else {
+        names.delete(ws.id);
+      }
+      broadcast(ws.room, { type: 'name-update', id: ws.id, name }, ws.id);
       return;
     }
 
@@ -140,7 +176,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = 3847;
 server.listen(PORT, () => {
   console.log(`webrtsee server running on http://localhost:${PORT}`);
 });
