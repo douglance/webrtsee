@@ -490,20 +490,83 @@ label {
 
 @media (max-width: 700px) {
   .panel {
-    padding: 24px;
+    padding: 20px;
+    max-height: calc(100vh - 40px);
+    max-height: calc(100dvh - 40px);
+    overflow-y: auto;
+    width: min(520px, calc(100vw - 32px));
   }
 
   .panel h1 {
-    font-size: 1.8rem;
+    font-size: 1.5rem;
+    margin: 8px 0 6px;
+  }
+
+  .panel p {
+    font-size: 0.9rem;
+    margin-bottom: 16px;
+    line-height: 1.4;
+  }
+
+  .badge {
+    padding: 4px 10px;
+    font-size: 0.7rem;
+  }
+
+  label {
+    font-size: 0.8rem;
+    margin-bottom: 6px;
+  }
+
+  #nameInput {
+    margin-bottom: 12px;
   }
 
   .row {
     flex-direction: column;
     align-items: stretch;
+    gap: 8px;
+  }
+
+  .row.secondary {
+    margin-top: 8px;
+    flex-direction: row;
+    gap: 6px;
+  }
+
+  #shareLink {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 8px 10px;
+    font-size: 0.75rem;
+  }
+
+  #copyLinkBtn,
+  #copyCodeBtn {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+  }
+
+  #copyLinkBtn svg,
+  #copyCodeBtn svg {
+    width: 16px;
+    height: 16px;
   }
 
   #joinBtn {
     width: 100%;
+    padding: 14px 18px;
+  }
+
+  .tips {
+    margin-top: 12px;
+    gap: 8px;
+    font-size: 0.75rem;
+  }
+
+  .tips span {
+    padding: 4px 8px;
   }
 
   #localVideo {
@@ -545,5 +608,57 @@ label {
     top: calc(76px + env(safe-area-inset-top));
     left: max(12px, env(safe-area-inset-left));
     margin-top: 0;
+  }
+}
+
+/* Very short screens (landscape phones) */
+@media (max-height: 500px) {
+  .panel {
+    padding: 16px;
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+  }
+
+  .panel h1 {
+    font-size: 1.3rem;
+    margin: 4px 0;
+  }
+
+  .panel p {
+    display: none;
+  }
+
+  .badge {
+    display: none;
+  }
+
+  label {
+    font-size: 0.75rem;
+    margin-bottom: 4px;
+  }
+
+  #nameInput {
+    margin-bottom: 8px;
+    padding: 10px 12px;
+  }
+
+  #roomInput {
+    padding: 10px 12px;
+  }
+
+  .row {
+    gap: 6px;
+  }
+
+  .row.secondary {
+    display: none;
+  }
+
+  #joinBtn {
+    padding: 12px 16px;
+  }
+
+  .tips {
+    display: none;
   }
 }
