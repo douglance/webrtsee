@@ -322,6 +322,21 @@ faceZoomBtn.addEventListener('click', () => {
   setFaceZoomEnabled(!faceZoomEnabled);
 });
 
+// Resume AudioContext on any user interaction (required by browser autoplay policy)
+document.addEventListener('click', async () => {
+  if (audioContext && audioContext.state === 'suspended') {
+    console.log('[AUDIO-DEBUG] User clicked, attempting to resume AudioContext');
+    await resumeAudioContext();
+  }
+}, { once: false });
+
+document.addEventListener('keydown', async () => {
+  if (audioContext && audioContext.state === 'suspended') {
+    console.log('[AUDIO-DEBUG] User pressed key, attempting to resume AudioContext');
+    await resumeAudioContext();
+  }
+}, { once: false });
+
 function setupDebugView() {
   if (debugView.group || debugView.overlay) {
     return;
@@ -699,6 +714,11 @@ function checkPlatformCollision(x, z, currentY) {
 }
 
 function registerPlatform(mesh, offsetY = 0) {
+  // Force matrix update through parent chain before computing bounds
+  mesh.updateWorldMatrix(true, false);
+  if (mesh.parent) {
+    mesh.parent.updateWorldMatrix(true, false);
+  }
   const box = new THREE.Box3().setFromObject(mesh);
   platforms.push({
     minX: box.min.x,
@@ -892,40 +912,117 @@ function setCopyState(button, label, isSuccess) {
 }
 
 function initAudioContext() {
+  console.log('[AUDIO-DEBUG] initAudioContext called, existing:', !!audioContext);
   if (audioContext) {
+    console.log('[AUDIO-DEBUG] AudioContext already exists, state:', audioContext.state);
     return;
   }
   const Context = window.AudioContext || window.webkitAudioContext;
   if (!Context) {
+    console.error('[AUDIO-DEBUG] AudioContext not available in this browser!');
     return;
   }
   audioContext = new Context();
   masterGain = audioContext.createGain();
   masterGain.gain.value = Number(masterVolume.value || 1);
   masterGain.connect(audioContext.destination);
+  console.log('[AUDIO-DEBUG] AudioContext created, state:', audioContext.state, 'masterGain:', masterGain.gain.value);
 }
 
 async function resumeAudioContext() {
-  if (!audioContext || audioContext.state !== 'suspended') {
-    return;
+  console.log('[AUDIO-DEBUG] resumeAudioContext called, context:', !!audioContext, 'state:', audioContext?.state);
+  if (!audioContext) {
+    console.log('[AUDIO-DEBUG] No audioContext to resume');
+    return false;
+  }
+  if (audioContext.state === 'running') {
+    console.log('[AUDIO-DEBUG] AudioContext already running');
+    return true;
+  }
+  if (audioContext.state === 'closed') {
+    console.error('[AUDIO-DEBUG] AudioContext is closed, cannot resume');
+    return false;
   }
   try {
     await audioContext.resume();
+    console.log('[AUDIO-DEBUG] AudioContext resumed, new state:', audioContext.state);
+    return audioContext.state === 'running';
   } catch (err) {
-    // Ignore resume errors.
+    console.error('[AUDIO-DEBUG] Failed to resume AudioContext:', err);
+    return false;
   }
 }
 
+// Ensure audio context is running - call this before any audio operation
+async function ensureAudioContextRunning() {
+  if (!audioContext) {
+    initAudioContext();
+  }
+  if (audioContext && audioContext.state !== 'running') {
+    return await resumeAudioContext();
+  }
+  return audioContext?.state === 'running';
+}
+
 function createLocalAudioStream(stream) {
+  console.log('[AUDIO-DEBUG] createLocalAudioStream called');
+  console.log('[AUDIO-DEBUG] audioContext:', !!audioContext, 'state:', audioContext?.state);
+  console.log('[AUDIO-DEBUG] stream:', !!stream, 'audioTracks:', stream?.getAudioTracks().length);
   if (!audioContext || !stream) {
+    console.error('[AUDIO-DEBUG] Cannot create local audio stream - missing audioContext or stream!');
     return null;
   }
+
+  // Warn if AudioContext is suspended
+  if (audioContext.state === 'suspended') {
+    console.warn('[AUDIO-DEBUG] AudioContext is SUSPENDED when creating local audio stream! Audio may not work until user interaction.');
+  }
+
+  const audioTracks = stream.getAudioTracks();
+  if (audioTracks.length === 0) {
+    console.error('[AUDIO-DEBUG] No audio tracks in input stream!');
+    return null;
+  }
+
+  console.log('[AUDIO-DEBUG] Input audio tracks:', audioTracks.map(t => ({
+    id: t.id,
+    label: t.label,
+    enabled: t.enabled,
+    muted: t.muted,
+    readyState: t.readyState
+  })));
+
+  // Ensure tracks are enabled
+  audioTracks.forEach(track => {
+    if (!track.enabled) {
+      console.warn('[AUDIO-DEBUG] Audio track was disabled, enabling it');
+      track.enabled = true;
+    }
+  });
+
   localMicSource = audioContext.createMediaStreamSource(stream);
   localMicGain = audioContext.createGain();
   localMicGain.gain.value = isMuted ? 0 : 1;
   localMicDestination = audioContext.createMediaStreamDestination();
   localMicSource.connect(localMicGain).connect(localMicDestination);
   localAudioStream = localMicDestination.stream;
+  const outputTracks = localAudioStream.getAudioTracks();
+
+  // Check if output stream has tracks
+  if (outputTracks.length === 0) {
+    console.error('[AUDIO-DEBUG] createMediaStreamDestination produced no audio tracks!');
+    // Fallback: use original track directly
+    console.log('[AUDIO-DEBUG] Falling back to original audio tracks');
+    localAudioStream = new MediaStream(audioTracks);
+  }
+
+  console.log('[AUDIO-DEBUG] Output audio stream created, tracks:', localAudioStream.getAudioTracks().map(t => ({
+    id: t.id,
+    label: t.label,
+    enabled: t.enabled,
+    muted: t.muted,
+    readyState: t.readyState
+  })));
   updateMuteButton();
   return localAudioStream;
 }
@@ -960,17 +1057,55 @@ function updateAudioListenerPosition() {
   }
 }
 
-function setupRemoteAudio(peerId, stream, trackId) {
+async function setupRemoteAudio(peerId, stream, trackId) {
+  console.log('[AUDIO-DEBUG] setupRemoteAudio called for peer', peerId, 'trackId:', trackId);
+
+  // Never play back our own audio (feedback prevention)
+  if (peerId === myId) {
+    console.log('[AUDIO-DEBUG] Skipping self audio - peerId matches myId');
+    return;
+  }
+
+  console.log('[AUDIO-DEBUG] audioContext:', !!audioContext, 'state:', audioContext?.state);
+  console.log('[AUDIO-DEBUG] stream:', !!stream, 'tracks:', stream?.getAudioTracks().length);
+
+  // Ensure audio context is initialized and running
+  if (!audioContext) {
+    console.log('[AUDIO-DEBUG] AudioContext not initialized, initializing now');
+    initAudioContext();
+  }
+
+  // Try to resume if suspended (browser autoplay policy)
+  if (audioContext && audioContext.state !== 'running') {
+    console.log('[AUDIO-DEBUG] AudioContext not running, attempting resume');
+    const resumed = await ensureAudioContextRunning();
+    if (!resumed) {
+      console.warn('[AUDIO-DEBUG] Could not resume AudioContext - user interaction may be needed');
+    }
+  }
+
   if (!audioContext || !stream) {
+    console.error('[AUDIO-DEBUG] Cannot setup remote audio - missing audioContext or stream!');
     return;
   }
   const existing = remoteAudioNodes.get(peerId);
   if (existing && existing.trackId === trackId) {
+    console.log('[AUDIO-DEBUG] Audio already set up for this track, skipping');
     return;
   }
   if (existing) {
+    console.log('[AUDIO-DEBUG] Cleaning up existing audio for peer', peerId);
     cleanupPeerAudio(peerId);
   }
+
+  const audioTracks = stream.getAudioTracks();
+  console.log('[AUDIO-DEBUG] Remote audio tracks:', audioTracks.map(t => ({
+    id: t.id,
+    label: t.label,
+    enabled: t.enabled,
+    muted: t.muted,
+    readyState: t.readyState
+  })));
 
   const source = audioContext.createMediaStreamSource(stream);
   const analyser = audioContext.createAnalyser();
@@ -988,6 +1123,8 @@ function setupRemoteAudio(peerId, stream, trackId) {
   gain.gain.value = 1;
 
   source.connect(analyser).connect(panner).connect(gain).connect(masterGain);
+  console.log('[AUDIO-DEBUG] Remote audio pipeline connected: source -> analyser -> panner -> gain -> masterGain');
+  console.log('[AUDIO-DEBUG] masterGain value:', masterGain.gain.value, 'connected to destination:', !!audioContext.destination);
 
   const nodeState = {
     source,
@@ -1277,10 +1414,12 @@ async function joinExperience() {
   });
   joinBtn.disabled = true;
   statusEl.textContent = 'Requesting camera + mic...';
+  console.log('[AUDIO-DEBUG] joinExperience: initializing audio context');
   initAudioContext();
   await resumeAudioContext();
 
   try {
+    console.log('[AUDIO-DEBUG] joinExperience: requesting getUserMedia with audio');
     localMediaStream = await navigator.mediaDevices.getUserMedia({
       video: {
         width: { ideal: 320, max: 640 },
@@ -1293,7 +1432,22 @@ async function joinExperience() {
         autoGainControl: true
       }
     });
+    console.log('[AUDIO-DEBUG] getUserMedia SUCCESS');
+    console.log('[AUDIO-DEBUG] Video tracks:', localMediaStream.getVideoTracks().map(t => ({
+      id: t.id,
+      label: t.label,
+      enabled: t.enabled,
+      readyState: t.readyState
+    })));
+    console.log('[AUDIO-DEBUG] Audio tracks:', localMediaStream.getAudioTracks().map(t => ({
+      id: t.id,
+      label: t.label,
+      enabled: t.enabled,
+      muted: t.muted,
+      readyState: t.readyState
+    })));
   } catch (err) {
+    console.error('[AUDIO-DEBUG] getUserMedia FAILED:', err);
     statusEl.textContent = 'Camera/mic access denied';
     joinBtn.disabled = false;
     return;
@@ -1315,7 +1469,17 @@ async function joinExperience() {
     localVideo.srcObject = localMediaStream;
   }
   playVideoElement(localVideo);
-  createLocalAudioStream(localMediaStream);
+  console.log('[AUDIO-DEBUG] About to call createLocalAudioStream');
+  const audioStreamResult = createLocalAudioStream(localMediaStream);
+  console.log('[AUDIO-DEBUG] createLocalAudioStream returned:', !!audioStreamResult);
+  console.log('[AUDIO-DEBUG] localAudioStream is now:', !!localAudioStream);
+  if (localAudioStream) {
+    console.log('[AUDIO-DEBUG] localAudioStream tracks:', localAudioStream.getAudioTracks().map(t => ({
+      id: t.id,
+      enabled: t.enabled,
+      readyState: t.readyState
+    })));
+  }
   overlay.classList.add('hidden');
   joined = true;
   shareBtn.disabled = false;
@@ -1495,9 +1659,20 @@ function createPeerConnection(peerId, isInitiator = false) {
   }
 
   if (localAudioStream) {
-    localAudioStream.getAudioTracks().forEach((track) => {
+    const audioTracks = localAudioStream.getAudioTracks();
+    console.log('[AUDIO-DEBUG] Adding audio tracks to peer', peerId, 'count:', audioTracks.length);
+    audioTracks.forEach((track) => {
+      console.log('[AUDIO-DEBUG] Adding audio track:', {
+        id: track.id,
+        label: track.label,
+        enabled: track.enabled,
+        muted: track.muted,
+        readyState: track.readyState
+      });
       pc.addTrack(track, localAudioStream);
     });
+  } else {
+    console.warn('[AUDIO-DEBUG] No localAudioStream available when creating peer connection for', peerId);
   }
 
   if (screenStream) {
@@ -1523,13 +1698,25 @@ function createPeerConnection(peerId, isInitiator = false) {
   pc.ontrack = (event) => {
     const [stream] = event.streams;
     const track = event.track;
+    console.log('[AUDIO-DEBUG] ontrack received from peer', peerId, 'track:', track?.kind, track?.id);
     if (!track) {
+      console.warn('[AUDIO-DEBUG] ontrack called but track is null');
       return;
     }
 
     if (track.kind === 'audio') {
+      console.log('[AUDIO-DEBUG] Received AUDIO track from peer', peerId, {
+        id: track.id,
+        label: track.label,
+        enabled: track.enabled,
+        muted: track.muted,
+        readyState: track.readyState
+      });
       const audioStream = new MediaStream([track]);
-      setupRemoteAudio(peerId, audioStream, track.id);
+      console.log('[AUDIO-DEBUG] Created audio stream for remote peer, tracks:', audioStream.getAudioTracks().length);
+      setupRemoteAudio(peerId, audioStream, track.id).catch(err => {
+        console.error('[AUDIO-DEBUG] Failed to setup remote audio:', err);
+      });
       return;
     }
 
@@ -1557,6 +1744,23 @@ function createPeerConnection(peerId, isInitiator = false) {
   };
 
   pc.onconnectionstatechange = () => {
+    console.log('[AUDIO-DEBUG] Connection state changed for peer', peerId, ':', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      const senders = pc.getSenders();
+      const audioSenders = senders.filter(s => s.track?.kind === 'audio');
+      console.log('[AUDIO-DEBUG] Connected! Audio senders:', audioSenders.map(s => ({
+        trackId: s.track?.id,
+        enabled: s.track?.enabled,
+        readyState: s.track?.readyState
+      })));
+      const receivers = pc.getReceivers();
+      const audioReceivers = receivers.filter(r => r.track?.kind === 'audio');
+      console.log('[AUDIO-DEBUG] Audio receivers:', audioReceivers.map(r => ({
+        trackId: r.track?.id,
+        enabled: r.track?.enabled,
+        readyState: r.track?.readyState
+      })));
+    }
     if (
       pc.connectionState === 'failed' ||
       pc.connectionState === 'disconnected' ||
@@ -1567,6 +1771,14 @@ function createPeerConnection(peerId, isInitiator = false) {
   };
 
   peerConnections.set(peerId, pc);
+  // Log all senders after setup
+  const allSenders = pc.getSenders();
+  console.log('[AUDIO-DEBUG] Peer connection created for', peerId, 'with', allSenders.length, 'senders');
+  console.log('[AUDIO-DEBUG] Senders:', allSenders.map(s => ({
+    kind: s.track?.kind,
+    trackId: s.track?.id,
+    enabled: s.track?.enabled
+  })));
   return pc;
 }
 
@@ -3339,7 +3551,7 @@ function createOfficeInterior() {
 
     const chair = createModernChair();
     chair.position.set(pos.x, 0, pos.z + (pos.rotation === 0 ? 1.2 : -1.2));
-    chair.rotation.y = pos.rotation;
+    chair.rotation.y = pos.rotation + Math.PI;
     group.add(chair);
   });
 
@@ -4364,3 +4576,214 @@ function createSecretMessage(text, size) {
 
   return plane;
 }
+
+// Debug helper - call from console: window.debugAudio()
+window.debugAudio = function() {
+  console.log('=== AUDIO DEBUG STATE ===');
+  console.log('AudioContext:', audioContext ? {
+    state: audioContext.state,
+    sampleRate: audioContext.sampleRate,
+    currentTime: audioContext.currentTime
+  } : 'NOT CREATED');
+
+  console.log('MasterGain:', masterGain ? {
+    value: masterGain.gain.value
+  } : 'NOT CREATED');
+
+  console.log('LocalMediaStream:', localMediaStream ? {
+    active: localMediaStream.active,
+    audioTracks: localMediaStream.getAudioTracks().map(t => ({
+      id: t.id,
+      label: t.label,
+      enabled: t.enabled,
+      muted: t.muted,
+      readyState: t.readyState
+    }))
+  } : 'NOT CREATED');
+
+  console.log('LocalAudioStream:', localAudioStream ? {
+    active: localAudioStream.active,
+    audioTracks: localAudioStream.getAudioTracks().map(t => ({
+      id: t.id,
+      label: t.label,
+      enabled: t.enabled,
+      muted: t.muted,
+      readyState: t.readyState
+    }))
+  } : 'NOT CREATED');
+
+  console.log('LocalMicGain:', localMicGain ? {
+    value: localMicGain.gain.value
+  } : 'NOT CREATED');
+
+  console.log('isMuted:', isMuted);
+
+  console.log('Peer Connections:');
+  peerConnections.forEach((pc, peerId) => {
+    const senders = pc.getSenders();
+    const receivers = pc.getReceivers();
+    console.log(`  Peer ${peerId}:`, {
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState,
+      audioSenders: senders.filter(s => s.track?.kind === 'audio').map(s => ({
+        trackId: s.track?.id,
+        enabled: s.track?.enabled,
+        readyState: s.track?.readyState
+      })),
+      audioReceivers: receivers.filter(r => r.track?.kind === 'audio').map(r => ({
+        trackId: r.track?.id,
+        enabled: r.track?.enabled,
+        readyState: r.track?.readyState
+      }))
+    });
+  });
+
+  console.log('Remote Audio Nodes:');
+  remoteAudioNodes.forEach((node, peerId) => {
+    console.log(`  Peer ${peerId}:`, {
+      trackId: node.trackId,
+      gainValue: node.gain.gain.value,
+      muted: node.muted,
+      level: node.level
+    });
+  });
+
+  // Diagnosis
+  console.log('\n=== DIAGNOSIS ===');
+  const issues = [];
+
+  if (!audioContext) {
+    issues.push('CRITICAL: AudioContext not created');
+  } else if (audioContext.state === 'suspended') {
+    issues.push('CRITICAL: AudioContext is SUSPENDED - click anywhere on page to resume');
+  } else if (audioContext.state === 'closed') {
+    issues.push('CRITICAL: AudioContext is CLOSED - page reload required');
+  }
+
+  if (masterGain && masterGain.gain.value === 0) {
+    issues.push('WARNING: Master gain is 0 - no audio will be heard');
+  }
+
+  if (!localMediaStream) {
+    issues.push('WARNING: No local media stream - microphone not captured');
+  } else {
+    const audioTracks = localMediaStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      issues.push('WARNING: Local media stream has no audio tracks');
+    } else {
+      audioTracks.forEach(t => {
+        if (!t.enabled) issues.push(`WARNING: Input audio track ${t.id} is disabled`);
+        if (t.readyState !== 'live') issues.push(`WARNING: Input audio track ${t.id} is not live (${t.readyState})`);
+      });
+    }
+  }
+
+  if (!localAudioStream) {
+    issues.push('WARNING: No processed local audio stream');
+  } else {
+    const audioTracks = localAudioStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      issues.push('WARNING: Processed audio stream has no audio tracks');
+    }
+  }
+
+  if (localMicGain && localMicGain.gain.value === 0 && !isMuted) {
+    issues.push('WARNING: Mic gain is 0 but not muted - outgoing audio silenced');
+  }
+
+  peerConnections.forEach((pc, peerId) => {
+    const audioSenders = pc.getSenders().filter(s => s.track?.kind === 'audio');
+    if (audioSenders.length === 0) {
+      issues.push(`WARNING: No audio sender for peer ${peerId}`);
+    }
+  });
+
+  if (issues.length === 0) {
+    console.log('No issues detected! Audio should be working.');
+  } else {
+    issues.forEach(issue => console.log(issue));
+  }
+
+  console.log('\n=== END AUDIO DEBUG ===');
+  return issues.length === 0 ? 'Audio appears healthy' : `Found ${issues.length} issues - check console`;
+};
+
+// Quick fix helper - call from console: window.fixAudio()
+window.fixAudio = async function() {
+  console.log('=== ATTEMPTING AUDIO FIX ===');
+
+  // 1. Initialize AudioContext if missing
+  if (!audioContext) {
+    console.log('Creating AudioContext...');
+    initAudioContext();
+  }
+
+  // 2. Resume AudioContext if suspended
+  if (audioContext && audioContext.state === 'suspended') {
+    console.log('Resuming AudioContext...');
+    await audioContext.resume();
+    console.log('AudioContext state:', audioContext.state);
+  }
+
+  // 3. Ensure masterGain is set
+  if (masterGain && masterGain.gain.value === 0) {
+    console.log('Setting master gain to 1...');
+    masterGain.gain.value = 1;
+  }
+
+  // 4. Enable any disabled tracks
+  if (localMediaStream) {
+    localMediaStream.getAudioTracks().forEach(track => {
+      if (!track.enabled) {
+        console.log('Enabling input track:', track.id);
+        track.enabled = true;
+      }
+    });
+  }
+
+  if (localAudioStream) {
+    localAudioStream.getAudioTracks().forEach(track => {
+      if (!track.enabled) {
+        console.log('Enabling output track:', track.id);
+        track.enabled = true;
+      }
+    });
+  }
+
+  // 5. Reset peer gains
+  remoteAudioNodes.forEach((node, peerId) => {
+    if (node.gain.gain.value === 0 && !node.muted) {
+      console.log('Resetting gain for peer:', peerId);
+      node.gain.gain.value = 1;
+    }
+  });
+
+  console.log('=== AUDIO FIX COMPLETE ===');
+  return window.debugAudio();
+};
+
+// Debug helper - call from console: window.debugPlatforms()
+window.debugPlatforms = function() {
+  console.log('=== PLATFORM DEBUG ===');
+  console.log('Total platforms:', platforms.length);
+
+  // Find platforms near center (within 5 units of origin on X/Z)
+  const centerPlatforms = platforms.filter(p =>
+    p.minX <= 5 && p.maxX >= -5 && p.minZ <= 5 && p.maxZ >= -5
+  );
+  console.log('\nPlatforms near center (x/z within [-5, 5]):');
+  centerPlatforms.forEach((p, i) => {
+    console.log(`  ${i}: x[${p.minX.toFixed(2)}, ${p.maxX.toFixed(2)}] z[${p.minZ.toFixed(2)}, ${p.maxZ.toFixed(2)}] y=${p.y.toFixed(2)}`);
+  });
+
+  // Check current player position
+  const pos = controls.getObject().position;
+  console.log('\nPlayer position:', `x=${pos.x.toFixed(2)}, y=${pos.y.toFixed(2)}, z=${pos.z.toFixed(2)}`);
+
+  // Check what platform affects player
+  const result = checkPlatformCollision(pos.x, pos.z, pos.y);
+  console.log('Current platform collision result:', result);
+  console.log('currentPlatformHeight:', currentPlatformHeight);
+
+  return platforms;
+};
